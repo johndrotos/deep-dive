@@ -577,7 +577,8 @@ def rank_topics_by_richness(
     if not kept:
         kept = dives[:keep]  # fallback: research/return order
 
-    dropped = [d.title for d in dives if d not in kept]
+    kept_ids = {id(d) for d in kept}
+    dropped = [d.title for d in dives if id(d) not in kept_ids]
     if dropped:
         _log(f"  {label}   topic filter: kept {len(kept)} of {len(dives)}; dropped: {'; '.join(dropped)}")
     return kept
