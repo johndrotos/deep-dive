@@ -2,24 +2,68 @@
 
 Pipeline per run:
   1. select_topics()      - one structured call, no tools, avoids history.
-  2. research_topic()     - streaming call WITH web search, real current links.
+  2. research_topic()     - non-streaming call WITH web search, real current links.
   3. structure_deep_dive() - one parse() call, no tools, research -> DeepDive.
 
 Splitting "research with tools" from "structure to schema" keeps each call reliable.
+
+Research is intentionally non-streaming and runs without extended thinking: a
+streaming + adaptive-thinking request goes silent on the wire during long server-side
+thinking, which trips read timeouts. Non-streaming requests are auto-retried by the SDK
+on timeout, so the pipeline self-heals from transient stalls.
 """
 
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
-from typing import List
+from typing import List, Optional
 
 import anthropic
 from pydantic import BaseModel, Field
 
+from . import verify
 from .models import DeepDive, Newsletter
+from .runlog import log as _log
 
-# Opus 4.8 supports the dynamic-filtering web search server tool.
-WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 8}
+# Transient server-side conditions worth retrying with backoff. An overload fires
+# before meaningful generation, so retrying it costs ~nothing in tokens.
+_RETRYABLE = (
+    anthropic.APITimeoutError,
+    anthropic.InternalServerError,  # 5xx, includes 529 overloaded
+    anthropic.APIConnectionError,
+)
+_BACKOFF_SECONDS = (5, 15, 40)
+
+
+# Two web-search server-tool variants:
+#   dynamic — writes+runs code to filter results before Claude reads them (thorough, but
+#             on some models runs away in an unbounded filtering loop);
+#   basic   — results go straight to Claude, no filtering step (fast, predictable).
+_WEB_SEARCH_DYNAMIC = "web_search_20260209"
+_WEB_SEARCH_BASIC = "web_search_20250305"
+
+
+class ResearchSettings(BaseModel):
+    """Search-depth knobs (from .env). Lower = faster/cheaper; raise for deeper digs.
+
+    Together these put a hard, predictable ceiling on how long one topic can research:
+    at most (max_rounds + 1) streamed turns, each doing at most max_uses web searches.
+    """
+
+    effort: str = "medium"          # low | medium | high — reasoning effort per turn
+    max_tokens: int = 8000          # length cap on the written brief
+    max_uses: int = 5               # web searches allowed PER streamed turn
+    max_rounds: int = 1             # extra pause_turn continuation rounds (0 = one turn)
+    dynamic_filtering: bool = False  # True = newer filtering tool; False = basic tool
+    candidate_items: int = 6        # how many items research proposes (over-provision)
+    final_items: int = 4            # how many survive selection onto the page
+
+    def web_search_tool(self) -> dict:
+        tool_type = _WEB_SEARCH_DYNAMIC if self.dynamic_filtering else _WEB_SEARCH_BASIC
+        return {"type": tool_type, "name": "web_search", "max_uses": self.max_uses}
 
 
 # --- Stage 1: topic selection ------------------------------------------------
@@ -79,12 +123,12 @@ def select_topics(
 
 
 _RESEARCH_SYSTEM = """\
-You are a brilliant, widely-read friend assembling a roughly 2-3 hour deep dive on a \
+You are a brilliant, widely-read friend assembling a 1-2 hour deep dive on a \
 single topic for someone you respect. Use web search to find the genuinely BEST \
 existing content — the stuff a knowledgeable insider would point to, not the top \
 Google results.
 
-Curate a mix of formats where they exist:
+Favor a FEW substantial, longer-form pieces over many short ones:
 - documentaries or long video essays
 - long-form written essays and serious journalism (quality outlets)
 - long YouTube videos / recorded lectures / talks
@@ -92,49 +136,229 @@ Curate a mix of formats where they exist:
 - the occasional canonical article, primary source, or book
 
 Hard requirements:
-- Every link must be REAL and found via search. Verify titles and sources. Never invent \
-URLs. Prefer durable, reputable sources over SEO content farms and listicles.
-- Aim for a total of about 2.5 hours of content across 5-8 items.
+- Propose a shortlist of strong candidate items (the exact number is specified per \
+request), ORDERED BEST-FIRST — most essential first. A later step verifies the links and \
+picks the final set, so give it good options to choose from, but never pad with weak \
+picks: a strong shortlist beats a long mediocre one.
+- Every link must be REAL and confirmed via search: point only to a specific page you \
+actually found in results (an exact article, video, or episode URL). NEVER invent a URL, \
+guess a slug, link a bare homepage/channel as a stand-in, or paste a search-results \
+page. If you cannot confirm a specific working URL for an item, drop that item rather \
+than pad. Prefer durable, reputable sources over SEO content farms and listicles.
+- Aim for a mix of formats (documentary, essay, video, podcast, article) so the final \
+selection can be well-rounded, not all one kind.
 - For each item, note its approximate duration and write a short, specific, warm note on \
 why it's worth their time and what to expect — like a friend handing it over, not a \
 catalog entry.
 - Also write an inviting introduction to the topic itself: what it is, why it's \
 fascinating, the thread that ties the picks together.
 
-Be discerning and opinionated. Quality and specificity over completeness."""
+Be discerning and opinionated. Every candidate should be one you'd genuinely recommend."""
+
+
+def _is_overloaded(exc: Exception) -> bool:
+    """True for a transient 'Overloaded' (529) surfaced as a generic APIStatusError."""
+    return isinstance(exc, anthropic.APIStatusError) and (
+        getattr(exc, "status_code", None) == 529 or "overload" in str(exc).lower()
+    )
+
+
+def _log_tool_block(block, searches: int, settings: "ResearchSettings", label: str) -> int:
+    """Print a completed web-search block or its result; return the running search count."""
+    btype = getattr(block, "type", None)
+    if btype == "server_tool_use" and getattr(block, "name", "") == "web_search":
+        searches += 1
+        inp = getattr(block, "input", None) or {}
+        query = inp.get("query", "") if isinstance(inp, dict) else ""
+        _log(f'  {label}   search {searches}/{settings.max_uses}: "{query}"')
+    elif btype == "web_search_tool_result":
+        content = getattr(block, "content", None)
+        if isinstance(content, list):
+            _log(f"  {label}       -> {len(content)} results")
+        else:
+            code = getattr(content, "error_code", None) or getattr(content, "type", None)
+            _log(f"  {label}       -> search returned: {code}")
+    return searches
+
+
+def _phase_name(block) -> str:
+    """Human-readable name for a content block, used to label which phase we're in."""
+    btype = getattr(block, "type", None)
+    if btype == "server_tool_use":
+        name = getattr(block, "name", "")
+        if name == "web_search":
+            return "web search"
+        if name in ("code_execution", "bash_code_execution"):
+            return "result filtering (code execution)"
+        return f"server tool: {name}"
+    if btype == "web_search_tool_result":
+        return "search results"
+    if btype in ("bash_code_execution_tool_result", "code_execution_tool_result"):
+        return "filter output"
+    if btype == "thinking":
+        return "thinking"
+    if btype == "text":
+        return "writing brief"
+    return btype or "unknown block"
+
+
+def _heartbeat(stop_event: threading.Event, state: dict, label: str) -> None:
+    """Fire every 15s even during a silent server-side step, reporting the live phase.
+
+    This is what de-black-boxes the long gap: if the stream goes quiet (e.g. the model is
+    running result-filtering code server-side), no events arrive — but this timer still
+    prints which phase we entered last and whether output tokens are growing, so we can
+    tell "stuck filtering" from "slowly writing text."
+    """
+    while not stop_event.wait(15):
+        _log(
+            f"  {label}   …still working: phase='{state['phase']}', "
+            f"~{state['out_tokens']} output tokens so far"
+        )
+
+
+def _handle_stream_event(event, stream, state, searches, settings, label) -> int:
+    """Process one stream event for logging; return the running search count."""
+    etype = event.type
+    if etype == "content_block_start":
+        phase = _phase_name(event.content_block)
+        state["phase"] = phase
+        # Searches are logged in full (with query) at stop; announce the start of every
+        # *other* phase so the post-search tail stops being a black box.
+        if phase != "web search":
+            _log(f"  {label}     · entering: {phase}")
+    elif etype == "content_block_stop":
+        try:
+            blocks = stream.current_message_snapshot.content
+        except Exception:  # noqa: BLE001 - snapshot best-effort for logging
+            blocks = []
+        if event.index < len(blocks):
+            searches = _log_tool_block(blocks[event.index], searches, settings, label)
+    elif etype == "message_delta":
+        usage = getattr(event, "usage", None)
+        if usage is not None and getattr(usage, "output_tokens", None):
+            state["out_tokens"] = usage.output_tokens
+    return searches
+
+
+def _stream_one_turn(client, model, messages, settings, label, container):
+    """Stream a single research turn with granular, phase-level logging.
+
+    We iterate the stream events so we can show what Claude is doing inside the turn:
+    every content block is announced as it *starts* (search / filtering / thinking /
+    writing brief), each completed ``web_search`` block prints its query against the
+    ``max_uses`` cap, and a background heartbeat reports the live phase + output-token
+    count every 15s so even a silent server-side step is visible. A one-line summary
+    closes out the turn.
+    """
+    extra = {"container": container} if container else {}
+    searches = 0
+    state = {"phase": "starting", "out_tokens": 0}
+    stop_event = threading.Event()
+    heartbeat = threading.Thread(
+        target=_heartbeat, args=(stop_event, state, label), daemon=True
+    )
+    heartbeat.start()
+    try:
+        with client.messages.stream(
+            model=model,
+            max_tokens=settings.max_tokens,
+            system=_RESEARCH_SYSTEM,
+            output_config={"effort": settings.effort},
+            tools=[settings.web_search_tool()],
+            messages=messages,
+            **extra,
+        ) as stream:
+            for event in stream:
+                searches = _handle_stream_event(
+                    event, stream, state, searches, settings, label
+                )
+            final = stream.get_final_message()
+    finally:
+        stop_event.set()
+
+    out_tokens = getattr(getattr(final, "usage", None), "output_tokens", "?")
+    _log(
+        f"  {label}   turn complete: {searches} search(es), "
+        f"{out_tokens} output tokens, stop_reason={final.stop_reason}"
+    )
+    return final
+
+
+def _stream_with_backoff(client, model, messages, settings, label, container=None):
+    """One streamed research turn, retried with backoff on transient server errors.
+
+    Streaming keeps the wire active so long jobs don't trip the read timeout; this loop
+    additionally absorbs overload/5xx blips that can arrive mid-stream. Retries are cheap
+    because these errors fire before substantial token generation.
+
+    ``container`` carries the code-execution container id when resuming a ``pause_turn``:
+    the dynamic-filtering web search tool runs code execution under the hood, and the API
+    requires the same container be passed back to continue a paused turn.
+    """
+    last_exc = None
+    for attempt in range(len(_BACKOFF_SECONDS) + 1):
+        try:
+            return _stream_one_turn(client, model, messages, settings, label, container)
+        except Exception as exc:  # noqa: BLE001 - re-raised below if not retryable
+            if not (isinstance(exc, _RETRYABLE) or _is_overloaded(exc)):
+                raise
+            last_exc = exc
+            if attempt < len(_BACKOFF_SECONDS):
+                wait = _BACKOFF_SECONDS[attempt]
+                _log(
+                    f"  {label}   transient API error ({type(exc).__name__}), "
+                    f"attempt {attempt + 1}/{len(_BACKOFF_SECONDS)} — retrying in {wait}s..."
+                )
+                time.sleep(wait)
+    raise RuntimeError(f"Research stream failed after retries: {last_exc}")
 
 
 def research_topic(
     client: anthropic.Anthropic,
     model: str,
     topic: _TopicIdea,
-    max_continuations: int = 4,
+    settings: "ResearchSettings",
+    label: str = "",
 ) -> str:
-    """Run a web-search-backed research pass; return Claude's rich markdown writeup."""
+    """Run a web-search-backed research pass; return Claude's rich markdown writeup.
+
+    Streamed (without extended thinking) so the connection stays active for the several
+    minutes a web-search-heavy request can take: streaming sends incremental deltas and
+    periodic keep-alive pings, so the read timeout never trips even on a long job. A
+    non-streaming version goes silent on the wire until the whole response is done, which
+    trips the read timeout and then re-runs the expensive request on every retry. The
+    ``pause_turn`` loop continues the server-side web search tool when it hits its
+    per-response iteration cap.
+    """
     user = (
         f"Topic: {topic.title}\n"
         f"Angle: {topic.angle}\n\n"
-        f"Search the web and assemble the deep dive. Produce a written brief: an "
-        f"introduction to the topic, then each curated item with its title, format, "
-        f"source/creator, the real URL, approximate duration, and your note on why it's "
-        f"worth it. End with the rough total time."
+        f"Search the web and assemble the deep dive. Propose {settings.candidate_items} "
+        f"candidate items, ordered best-first. Produce a written brief: an introduction to "
+        f"the topic, then each candidate item with its title, format, source/creator, the "
+        f"real URL, approximate duration, and your note on why it's worth it."
     )
     messages = [{"role": "user", "content": user}]
 
-    for _ in range(max_continuations + 1):
-        with client.messages.stream(
-            model=model,
-            max_tokens=16000,
-            system=_RESEARCH_SYSTEM,
-            thinking={"type": "adaptive"},
-            tools=[WEB_SEARCH_TOOL],
-            messages=messages,
-        ) as stream:
-            final = stream.get_final_message()
-
+    final = None
+    container = None  # code-execution container id, carried across pause_turn rounds
+    total_rounds = settings.max_rounds + 1
+    for round_i in range(total_rounds):
+        if total_rounds > 1:
+            _log(f"  {label}   round {round_i + 1}/{total_rounds}...")
+        final = _stream_with_backoff(client, model, messages, settings, label, container)
         if final.stop_reason == "pause_turn":
-            # Server tool loop hit its cap; resend to let it continue.
+            # Server tool loop hit its cap; resend the assistant content (no extra
+            # "continue" message — the API resumes from the trailing server_tool_use)
+            # and pass the container back so its pending tool use can complete.
+            _log(
+                f"  {label}   paused (hit tool-iteration cap); continuing for another round"
+                if round_i + 1 < total_rounds
+                else f"  {label}   paused, but out of rounds — using what we have"
+            )
             messages.append({"role": "assistant", "content": final.content})
+            container = getattr(getattr(final, "container", None), "id", None) or container
             continue
         break
 
@@ -174,6 +398,83 @@ def structure_deep_dive(
     return dive
 
 
+# --- Stage 4: select the best items from the verified candidates -------------
+
+
+_SELECT_SYSTEM = """\
+You are the curator finalizing a Deep Dive. From a list of VERIFIED candidate items \
+(their links already resolve), choose the best ones that together form a well-rounded \
+1-2 hour exploration. Optimize for, in order: (1) quality — pick the genuinely best \
+pieces; (2) a MIX of formats — don't return all podcasts or all videos; (3) a sensible \
+reading/watching arc across the ones you keep. Return ONLY the indices of the items to \
+keep, ordered as they should appear on the page."""
+
+
+class _Selection(BaseModel):
+    keep: List[int] = Field(
+        description="0-based indices of the items to keep, in final page order (best/"
+        "most essential first)."
+    )
+
+
+def select_deep_dive(
+    client: anthropic.Anthropic,
+    model: str,
+    dive: DeepDive,
+    final_items: int,
+    label: str = "",
+) -> DeepDive:
+    """Pick the best ``final_items`` from a verified DeepDive's candidates.
+
+    Selection is by INDEX into the existing items, and we rebuild ``items`` from the
+    original ContentItem objects — so the chosen links/notes are the exact verified ones
+    and selection can never introduce a new (possibly hallucinated) URL. Falls back to the
+    research order if the model returns nothing usable; skips the call entirely when there
+    aren't more candidates than we need.
+    """
+    items = dive.items
+    if len(items) <= final_items:
+        return dive  # nothing to trim — keep all survivors
+
+    listing = "\n".join(
+        f"[{i}] ({it.kind}, {it.duration}) {it.title} — {it.source}\n"
+        f"     {' '.join((it.note or '').split())[:200]}"
+        for i, it in enumerate(items)
+    )
+    user = (
+        f"Topic: {dive.title}\n\n"
+        f"Verified candidate items:\n{listing}\n\n"
+        f"Choose the best {final_items} to keep, ordered for the page. Return their indices."
+    )
+    sel = None
+    try:
+        response = client.messages.parse(
+            model=model,
+            max_tokens=500,
+            system=_SELECT_SYSTEM,
+            messages=[{"role": "user", "content": user}],
+            output_format=_Selection,
+        )
+        sel = response.parsed_output
+    except Exception as exc:  # noqa: BLE001 - fall back to research order on any failure
+        _log(f"  {label}   selection call failed ({type(exc).__name__}); keeping first {final_items}")
+
+    kept: List = []
+    if sel is not None:
+        seen = set()
+        for idx in sel.keep:
+            if 0 <= idx < len(items) and idx not in seen:
+                seen.add(idx)
+                kept.append(items[idx])
+            if len(kept) >= final_items:
+                break
+    if not kept:
+        kept = items[:final_items]  # fallback: research's best-first ordering
+
+    _log(f"  {label}   selected {len(kept)} of {len(items)} candidates for the page")
+    return dive.model_copy(update={"items": kept})
+
+
 # --- Orchestration -----------------------------------------------------------
 
 
@@ -202,17 +503,87 @@ def _edition_intro(
     return "".join(b.text for b in response.content if b.type == "text").strip()
 
 
+def _research_and_structure(
+    client: anthropic.Anthropic,
+    model: str,
+    topic: _TopicIdea,
+    settings: "ResearchSettings",
+    label: str,
+) -> DeepDive:
+    """Full per-topic pipeline (research -> structure). One unit of parallel work."""
+    _log(f"  {label} researching '{topic.title}'...")
+    brief = research_topic(client, model, topic, settings, label)
+    _log(f"  {label}   structuring brief into a deep dive...")
+    dive = structure_deep_dive(client, model, topic, brief)
+    _log(f"  {label}   verifying {len(dive.items)} candidate links...")
+    dive = verify.verify_dive(dive, label)
+    _log(f"  {label}   selecting best {settings.final_items} of {len(dive.items)}...")
+    dive = select_deep_dive(client, model, dive, settings.final_items, label)
+    _log(f"  {label} done: {topic.title} ({len(dive.items)} items)")
+    return dive
+
+
+def make_topic(title: str, angle: str) -> "_TopicIdea":
+    """Build a topic from a title + angle — used to feed a fixed set (e.g. an A/B run)."""
+    return _TopicIdea(title=title, angle=angle)
+
+
 def build_newsletter(
-    client: anthropic.Anthropic, model: str, history: List[str], count: int
+    client: anthropic.Anthropic,
+    model: str,
+    history: List[str],
+    count: int,
+    settings: "ResearchSettings",
+    topics: "Optional[List[_TopicIdea]]" = None,
 ) -> Newsletter:
-    """Run the full pipeline and return a finished Newsletter."""
-    topics = select_topics(client, model, history, count)
+    """Run the full pipeline and return a finished Newsletter.
 
-    dives: List[DeepDive] = []
+    If ``topics`` is given, those are researched verbatim (fixed-topics mode, for A/B
+    experiments where the topics must be held constant); otherwise topics are selected
+    fresh, avoiding ``history``.
+    """
+    if topics is None:
+        topics = select_topics(client, model, history, count)
+        _log("  Topics chosen:")
+    else:
+        _log("  Topics (fixed):")
     for topic in topics:
-        brief = research_topic(client, model, topic)
-        dives.append(structure_deep_dive(client, model, topic, brief))
+        _log(f"    - {topic.title}")
 
+    # Topics are independent, stateless API calls, and each spends almost all its time
+    # waiting on the network — so research them concurrently. The wall-clock becomes
+    # ~the slowest topic instead of the sum of all three (the SDK releases the GIL
+    # during I/O, so threads give near-linear speedup here). Results are slotted back in
+    # topic order; a topic that fails is logged and skipped rather than sinking the issue.
+    total = len(topics)
+    slots: List[Optional[DeepDive]] = [None] * total
+    errors: List[str] = []
+    _log(f"  Researching {total} topics in parallel...")
+    with ThreadPoolExecutor(max_workers=total) as pool:
+        futures = {
+            pool.submit(
+                _research_and_structure,
+                client,
+                model,
+                topic,
+                settings,
+                f"[{i}/{total}]",
+            ): i
+            for i, topic in enumerate(topics, 1)
+        }
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                slots[i - 1] = future.result()
+            except Exception as exc:  # noqa: BLE001 - keep the other topics' results
+                errors.append(f"{topics[i - 1].title}: {exc}")
+                _log(f"  [{i}/{total}] FAILED: {exc}")
+
+    dives = [d for d in slots if d is not None]
+    if not dives:
+        raise RuntimeError("All topics failed to research:\n" + "\n".join(errors))
+
+    _log("  Writing the editor's note...")
     intro = _edition_intro(client, model, dives)
     return Newsletter(
         edition_date=date.today().strftime("%A, %B %-d, %Y"),

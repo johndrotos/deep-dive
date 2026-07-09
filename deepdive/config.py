@@ -28,6 +28,21 @@ class Config:
     data_dir: str
     deep_dive_count: int
     newsletter_title: str
+    # Search-depth knobs (speed vs. thoroughness). Lower = faster/cheaper.
+    research_effort: str
+    research_max_tokens: int
+    research_max_uses: int
+    research_max_rounds: int
+    # Web-search tool variant. True = newer dynamic-filtering tool (thorough but can
+    # run away in a filtering loop); False = basic tool (fast, results go straight to Claude).
+    research_dynamic_filtering: bool
+    # Over-provision + select: research this many candidate items, verify them, then keep
+    # the best `deep_dive_items` survivors.
+    research_candidate_items: int
+    deep_dive_items: int
+    # Model used to JUDGE issue quality in the eval (a stronger model than the writer, so
+    # it isn't grading its own work).
+    eval_judge_model: str
 
     @classmethod
     def load(cls, *, require_secrets: bool = True) -> "Config":
@@ -56,10 +71,22 @@ class Config:
                 + ".\nCopy .env.example to .env and fill them in, or set them in Railway."
             )
 
-        try:
-            deep_dive_count = int(os.environ.get("DEEP_DIVE_COUNT", "3"))
-        except ValueError:
-            deep_dive_count = 3
+        def int_env(name: str, default: int, minimum: int = 0) -> int:
+            try:
+                return max(minimum, int(os.environ.get(name, str(default))))
+            except ValueError:
+                return default
+
+        def bool_env(name: str, default: bool) -> bool:
+            raw = os.environ.get(name, "").strip().lower()
+            if raw in ("1", "true", "yes", "on"):
+                return True
+            if raw in ("0", "false", "no", "off"):
+                return False
+            return default
+
+        deep_dive_count = int_env("DEEP_DIVE_COUNT", 3, minimum=1)
+        research_effort = os.environ.get("SEARCH_EFFORT", "medium").strip() or "medium"
 
         return cls(
             anthropic_api_key=anthropic_api_key,
@@ -69,7 +96,16 @@ class Config:
             model=os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8").strip()
             or "claude-opus-4-8",
             data_dir=os.environ.get("DATA_DIR", "./data").strip() or "./data",
-            deep_dive_count=max(1, deep_dive_count),
+            deep_dive_count=deep_dive_count,
             newsletter_title=os.environ.get("NEWSLETTER_TITLE", "The Deep Dive").strip()
             or "The Deep Dive",
+            research_effort=research_effort,
+            research_max_tokens=int_env("SEARCH_MAX_TOKENS", 8000, minimum=1000),
+            research_max_uses=int_env("SEARCH_MAX_USES", 5, minimum=1),
+            research_max_rounds=int_env("SEARCH_MAX_ROUNDS", 1, minimum=0),
+            research_dynamic_filtering=bool_env("SEARCH_DYNAMIC_FILTERING", False),
+            research_candidate_items=int_env("SEARCH_CANDIDATE_ITEMS", 6, minimum=2),
+            deep_dive_items=int_env("DEEP_DIVE_ITEMS", 4, minimum=1),
+            eval_judge_model=os.environ.get("EVAL_JUDGE_MODEL", "claude-opus-4-8").strip()
+            or "claude-opus-4-8",
         )

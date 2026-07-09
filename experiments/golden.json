@@ -1,0 +1,21 @@
+{
+  "_comment": "Fixed topic set for A/B experiments. Hold these constant so score deltas are attributable to settings, not topic luck. Mix of content-rich and obscure on purpose.",
+  "topics": [
+    {
+      "title": "The Race to Solve Longitude",
+      "angle": "The 18th-century contest between clockmakers and astronomers to fix a ship's position at sea — a content-rich topic with famous books, docs, and lectures."
+    },
+    {
+      "title": "Synesthesia and the Crossed Senses",
+      "angle": "People who taste words or see colored numbers — a well-covered science topic with TED talks, essays, and podcasts."
+    },
+    {
+      "title": "The Whistled Languages of Mountain Villages",
+      "angle": "Full languages conveyed entirely by whistling across valleys — a genuinely obscure topic where good content is scarcer."
+    },
+    {
+      "title": "The Bog Bodies of Iron Age Europe",
+      "angle": "Preserved millennia-old corpses pulled from peat bogs, and what they reveal about ritual and violence — niche but with some strong documentaries."
+    }
+  ]
+}

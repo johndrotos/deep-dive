@@ -12,9 +12,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import webbrowser
+from datetime import datetime
 
 from . import curator, history, mailer, renderer
 from .config import Config, ConfigError
@@ -22,6 +24,7 @@ from .models import Newsletter
 from .samples import sample_newsletter
 
 _PREVIEW_PATH = os.path.join("out", "preview.html")
+_ISSUE_PATH = os.path.join("out", "issue.json")
 
 
 def _write_preview(html: str) -> str:
@@ -31,16 +34,59 @@ def _write_preview(html: str) -> str:
     return os.path.abspath(_PREVIEW_PATH)
 
 
+def _write_issue_json(newsletter: Newsletter, cfg: Config, settings) -> str:
+    """Persist the structured issue + the settings that produced it, for the evaluator."""
+    os.makedirs(os.path.dirname(_ISSUE_PATH), exist_ok=True)
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "model": cfg.model,
+        "settings": settings.model_dump(),
+        "newsletter": newsletter.model_dump(),
+    }
+    with open(_ISSUE_PATH, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+    return os.path.abspath(_ISSUE_PATH)
+
+
 def _build(cfg: Config) -> Newsletter:
     import anthropic
 
-    client = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
+    # The research call is streamed, so the connection stays active for the several
+    # minutes a web-search-heavy request takes (no more silent-wire read timeouts).
+    # A couple of retries absorb transient connection-level overloads cheaply; the
+    # research call adds its own backoff loop for mid-stream overload errors.
+    client = anthropic.Anthropic(
+        api_key=cfg.anthropic_api_key,
+        timeout=600.0,
+        max_retries=2,
+    )
+    settings = curator.ResearchSettings(
+        effort=cfg.research_effort,
+        max_tokens=cfg.research_max_tokens,
+        max_uses=cfg.research_max_uses,
+        max_rounds=cfg.research_max_rounds,
+        dynamic_filtering=cfg.research_dynamic_filtering,
+        candidate_items=cfg.research_candidate_items,
+        final_items=cfg.deep_dive_items,
+    )
     past = history.past_topics(cfg.data_dir)
     print(f"  Avoiding {len(past)} previously-covered topics.")
+    tool = "dynamic-filtering" if settings.dynamic_filtering else "basic"
+    print(
+        f"  Search depth: effort={settings.effort}, max_tokens={settings.max_tokens}, "
+        f"max_uses={settings.max_uses}, max_rounds={settings.max_rounds}, tool={tool}."
+    )
+    print(
+        f"  Curation: research {settings.candidate_items} candidates per topic, "
+        f"verify, then select the best {settings.final_items}."
+    )
     print("  Selecting topics and researching (this takes a few minutes)...")
-    newsletter = curator.build_newsletter(client, cfg.model, past, cfg.deep_dive_count)
+    newsletter = curator.build_newsletter(
+        client, cfg.model, past, cfg.deep_dive_count, settings
+    )
     for dive in newsletter.deep_dives:
         print(f"    - {dive.title} ({len(dive.items)} items)")
+    _write_issue_json(newsletter, cfg, settings)
     return newsletter
 
 
@@ -65,6 +111,11 @@ def run(argv: list[str] | None = None) -> int:
         "--no-open",
         action="store_true",
         help="Don't auto-open the preview in a browser.",
+    )
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="Curate (no email), then score the issue on quality metrics and print a scorecard.",
     )
     args = parser.parse_args(argv)
 
@@ -92,14 +143,18 @@ def run(argv: list[str] | None = None) -> int:
     subject = renderer.subject_line(newsletter, cfg.newsletter_title)
     topics = [d.title for d in newsletter.deep_dives]
 
-    if args.dry_run:
+    if args.dry_run or args.eval:
         path = _write_preview(html)
-        print(f"\nDry run. Subject would be:\n  {subject}")
+        label = "Eval run" if args.eval else "Dry run"
+        print(f"\n{label}. Subject would be:\n  {subject}")
         print(f"Wrote preview: {path}")
         if args.record:
             history.record(cfg.data_dir, topics)
             print(f"Recorded {len(topics)} topics to history.")
-        if not args.no_open:
+        if args.eval:
+            from . import evaluate
+            evaluate.evaluate_issue(_ISSUE_PATH, cfg)
+        elif not args.no_open:
             webbrowser.open(f"file://{path}")
         return 0
 
