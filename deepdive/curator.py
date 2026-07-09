@@ -494,6 +494,95 @@ def select_deep_dive(
     return dive.model_copy(update={"items": kept})
 
 
+# --- Stage 5: rank whole topics by researched richness -----------------------
+
+
+_TOPIC_RANK_SYSTEM = """\
+You are the editor of "The Deep Dive," choosing which of several fully-researched \
+topics are strong enough to run this week. Each topic below shows its framing and the \
+real content that research actually found for it.
+
+Keep the topics that form the richest, most substantial ~2-hour journeys. Reward, in \
+order:
+1. DEPTH & SUBSTANCE — genuinely enough excellent material for two hours, not one thin \
+idea padded out. An abundance of serious long-form (documentaries, academic/serious \
+writing, substantial videos and lectures, real podcast episodes) is the strongest signal.
+2. CURATION — a coherent throughline, a topic with real texture and places to go, not a \
+single-fact curiosity ("huh, neat" and you're done).
+3. VARIETY across the kept set — different domains and moods.
+
+Drop the thin ones: topics whose found content is sparse, mostly one format, padded, or \
+only tangentially on-topic. Return ONLY the indices of the topics to keep, best-first."""
+
+
+class _TopicRanking(BaseModel):
+    keep: List[int] = Field(
+        description="0-based indices of the topics to keep, best-first."
+    )
+
+
+def rank_topics_by_richness(
+    client: anthropic.Anthropic,
+    judge_model: str,
+    dives: List[DeepDive],
+    keep: int,
+    label: str = "",
+) -> List[DeepDive]:
+    """Keep the ``keep`` richest researched topics, judged by a stronger (Opus) model.
+
+    Ranking is by INDEX into ``dives`` and we rebuild from the original DeepDive objects,
+    so the judge can only subset/reorder — never invent a topic (same safety property as
+    ``select_deep_dive``). Skips the call when there aren't more topics than we need, and
+    falls back to the first ``keep`` on any failure.
+    """
+    if len(dives) <= keep:
+        return dives  # nothing to trim
+
+    listing = "\n".join(
+        f"[{i}] {d.title} — {d.dek}\n"
+        f"     {' '.join((d.hook or '').split())[:300]}\n"
+        f"     found content:\n" + "\n".join(
+            f"       - ({it.kind}, {it.duration}) {it.title} — {it.source}"
+            for it in d.items
+        )
+        for i, d in enumerate(dives)
+    )
+    user = (
+        f"Researched topics:\n{listing}\n\n"
+        f"Keep the best {keep}, ordered best-first. Return their indices."
+    )
+
+    ranking = None
+    try:
+        response = client.messages.parse(
+            model=judge_model,
+            max_tokens=500,
+            system=_TOPIC_RANK_SYSTEM,
+            messages=[{"role": "user", "content": user}],
+            output_format=_TopicRanking,
+        )
+        ranking = response.parsed_output
+    except Exception as exc:  # noqa: BLE001 - fall back to research order on any failure
+        _log(f"  topic-rank call failed ({type(exc).__name__}); keeping first {keep}")
+
+    kept: List[DeepDive] = []
+    if ranking is not None:
+        seen = set()
+        for idx in ranking.keep:
+            if 0 <= idx < len(dives) and idx not in seen:
+                seen.add(idx)
+                kept.append(dives[idx])
+            if len(kept) >= keep:
+                break
+    if not kept:
+        kept = dives[:keep]  # fallback: research/return order
+
+    dropped = [d.title for d in dives if d not in kept]
+    if dropped:
+        _log(f"  topic filter: kept {len(kept)} of {len(dives)}; dropped: {'; '.join(dropped)}")
+    return kept
+
+
 # --- Orchestration -----------------------------------------------------------
 
 
