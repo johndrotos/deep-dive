@@ -120,7 +120,8 @@ def run_experiment(topics_path: str, variant_specs: List[str], limit: Optional[i
     for label, settings in variants:
         print(f"\n=== variant: {label} ===", flush=True)
         newsletter = curator.build_newsletter(
-            client, cfg.model, [], len(topics), settings, topics=topics
+            client, cfg.model, [], len(topics), settings, cfg.eval_judge_model,
+            topics=topics,
         )
         scores = evaluate.compute_scores(
             newsletter, settings.final_items, cfg.eval_judge_model, client

@@ -115,11 +115,14 @@ every time. Curation "taste" lives in prompts + the model's judgment, not in cod
 
 ### The per-issue sequence (in `curator.build_newsletter`)
 
-For each of `DEEP_DIVE_COUNT` topics, run **in parallel** (`ThreadPoolExecutor`):
+Research runs **in parallel** (`ThreadPoolExecutor`) across `TOPIC_CANDIDATES` topics, then a
+judge keeps the best `DEEP_DIVE_COUNT`:
 
-1. **Select topics** (`select_topics`) — one structured call, no web. Returns title+angle
-   pairs, avoiding the last ~200 history topics. (In A/B mode, a fixed topic list is passed
-   in instead via `build_newsletter(topics=...)` / `make_topic`.)
+1. **Select topics** (`select_topics`) — one structured call, no web. Returns
+   `TOPIC_CANDIDATES` (default 5) title+angle pairs, avoiding the last ~200 history topics.
+   Over-provisions so the topic filter (step 6) can drop the thin ones. (In A/B mode, a fixed
+   topic list is passed in instead via `build_newsletter(topics=...)` / `make_topic`, and
+   neither over-provisioning nor the filter runs.)
 
 2. **Research** (`research_topic` → `_stream_with_backoff` → `_stream_one_turn`) — the
    agentic step. **Streamed** (critical — see lessons below), with the **basic web-search
@@ -142,7 +145,13 @@ For each of `DEEP_DIVE_COUNT` topics, run **in parallel** (`ThreadPoolExecutor`)
    **Hallucination-safe by construction:** the model returns *indices*, and we rebuild
    `items` from the original `ContentItem` objects — selection can never introduce a new URL.
 
-6. **Editor's note** (`_edition_intro`) + assemble the `Newsletter`.
+6. **Topic filter** (`rank_topics_by_richness`) — after all `TOPIC_CANDIDATES` topics are
+   researched, one Opus (`EVAL_JUDGE_MODEL`) call keeps the richest `DEEP_DIVE_COUNT`,
+   dropping topics whose found content is thin. **Index-based** (rebuilds from the real
+   `DeepDive` objects, so it can never invent a topic) and fail-safe to the first N. Normal
+   path only — the A/B fixed-topics path is never filtered.
+
+7. **Editor's note** (`_edition_intro`) + assemble the `Newsletter`.
 
 Then `main.py`: **render** (`renderer.render_html`) → **send** (`mailer.send`, Resend) →
 **record history** (`history.record`). On a `--dry-run`/`--eval`, it writes
@@ -272,6 +281,7 @@ tokens), `EVAL_JUDGE_MODEL` (judge; `claude-opus-4-8`), `DATA_DIR`, `NEWSLETTER_
 **Search depth / curation (all tunable, no code change):**
 | Var | Meaning |
 |---|---|
+| `TOPIC_CANDIDATES` | candidate topics researched before the judge keeps the best `DEEP_DIVE_COUNT` (over-provision, default 5) |
 | `SEARCH_EFFORT` | reasoning effort per turn (low/medium/high) |
 | `SEARCH_MAX_TOKENS` | length cap on the brief (main speed lever) |
 | `SEARCH_MAX_USES` | web searches per turn |

@@ -642,16 +642,21 @@ def build_newsletter(
     history: List[str],
     count: int,
     settings: "ResearchSettings",
+    judge_model: str,
     topics: "Optional[List[_TopicIdea]]" = None,
+    topic_candidates: "Optional[int]" = None,
 ) -> Newsletter:
     """Run the full pipeline and return a finished Newsletter.
 
-    If ``topics`` is given, those are researched verbatim (fixed-topics mode, for A/B
-    experiments where the topics must be held constant); otherwise topics are selected
-    fresh, avoiding ``history``.
+    ``count`` is how many deep dives ship. In the normal path we research
+    ``topic_candidates`` topics (default ``count``; set higher to over-provision) and an
+    Opus ``judge_model`` keeps the richest ``count``. If ``topics`` is given (fixed-topics
+    mode, for A/B experiments), those are researched verbatim and none are filtered.
     """
-    if topics is None:
-        topics = select_topics(client, model, history, count)
+    topics_selected_fresh = topics is None
+    if topics_selected_fresh:
+        n_candidates = topic_candidates or count
+        topics = select_topics(client, model, history, n_candidates)
         _log("  Topics chosen:")
     else:
         _log("  Topics (fixed):")
@@ -690,6 +695,12 @@ def build_newsletter(
     dives = [d for d in slots if d is not None]
     if not dives:
         raise RuntimeError("All topics failed to research:\n" + "\n".join(errors))
+
+    # Normal path over-provisions topics; keep only the richest `count`. Fixed-topics
+    # mode (A/B) holds its set constant, so skip filtering there.
+    if topics_selected_fresh and len(dives) > count:
+        _log(f"  Judging {len(dives)} researched topics; keeping the best {count}...")
+        dives = rank_topics_by_richness(client, judge_model, dives, count)
 
     _log("  Writing the editor's note...")
     intro = _edition_intro(client, model, dives)

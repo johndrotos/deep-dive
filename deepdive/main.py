@@ -77,12 +77,14 @@ def _build(cfg: Config) -> Newsletter:
         f"max_uses={settings.max_uses}, max_rounds={settings.max_rounds}, tool={tool}."
     )
     print(
-        f"  Curation: research {settings.candidate_items} candidates per topic, "
-        f"verify, then select the best {settings.final_items}."
+        f"  Curation: research {cfg.topic_candidates} topics, judge-select the best "
+        f"{cfg.deep_dive_count}; per topic research {settings.candidate_items} "
+        f"candidates, verify, then select the best {settings.final_items}."
     )
     print("  Selecting topics and researching (this takes a few minutes)...")
     newsletter = curator.build_newsletter(
-        client, cfg.model, past, cfg.deep_dive_count, settings
+        client, cfg.model, past, cfg.deep_dive_count, settings,
+        cfg.eval_judge_model, topic_candidates=cfg.topic_candidates,
     )
     for dive in newsletter.deep_dives:
         print(f"    - {dive.title} ({len(dive.items)} items)")
