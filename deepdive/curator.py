@@ -563,7 +563,7 @@ def rank_topics_by_richness(
         )
         ranking = response.parsed_output
     except Exception as exc:  # noqa: BLE001 - fall back to research order on any failure
-        _log(f"  topic-rank call failed ({type(exc).__name__}); keeping first {keep}")
+        _log(f"  {label}   topic-rank call failed ({type(exc).__name__}); keeping first {keep}")
 
     kept: List[DeepDive] = []
     if ranking is not None:
@@ -579,7 +579,7 @@ def rank_topics_by_richness(
 
     dropped = [d.title for d in dives if d not in kept]
     if dropped:
-        _log(f"  topic filter: kept {len(kept)} of {len(dives)}; dropped: {'; '.join(dropped)}")
+        _log(f"  {label}   topic filter: kept {len(kept)} of {len(dives)}; dropped: {'; '.join(dropped)}")
     return kept
 
 

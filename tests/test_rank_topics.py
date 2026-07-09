@@ -1,8 +1,5 @@
 """Unit tests for the post-research topic richness filter."""
 
-import pytest
-
-from deepdive import curator
 from deepdive.curator import rank_topics_by_richness, _TopicRanking
 from deepdive.models import ContentItem, DeepDive
 
