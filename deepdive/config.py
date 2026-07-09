@@ -27,6 +27,10 @@ class Config:
     model: str
     data_dir: str
     deep_dive_count: int
+    # How many candidate topics to research before the judge keeps the best
+    # `deep_dive_count`. Over-provisioning lets us drop topics whose researched
+    # content turns out thin. Only used in the normal (non-fixed-topics) path.
+    topic_candidates: int
     newsletter_title: str
     # Search-depth knobs (speed vs. thoroughness). Lower = faster/cheaper.
     research_effort: str
@@ -97,6 +101,7 @@ class Config:
             or "claude-opus-4-8",
             data_dir=os.environ.get("DATA_DIR", "./data").strip() or "./data",
             deep_dive_count=deep_dive_count,
+            topic_candidates=int_env("TOPIC_CANDIDATES", 5, minimum=1),
             newsletter_title=os.environ.get("NEWSLETTER_TITLE", "The Deep Dive").strip()
             or "The Deep Dive",
             research_effort=research_effort,
