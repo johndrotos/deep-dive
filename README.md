@@ -5,7 +5,7 @@ issue with **3 niche, obscure, intellectually interesting deep dives** — each 
 of curated content (documentaries, long essays, long videos, podcasts, quality articles),
 written like a knowledgeable friend pointed you at the best stuff.
 
-- **LLM:** Anthropic Claude (`claude-opus-4-8`)
+- **LLM:** Anthropic Claude (`claude-opus-5`)
 - **Real links:** Claude curates with live **web search**, so URLs are real, not invented
 - **Email:** Resend
 - **Runs itself:** Railway cron, every Sunday ~8am
@@ -107,5 +107,5 @@ railway.json     start command + weekly cron
 ## Cost & tuning
 
 One run a week, so cost is small (roughly cents to a couple dollars depending on how much
-the model searches). Knobs via env vars: `ANTHROPIC_MODEL` (e.g. `claude-sonnet-4-6` to
+the model searches). Knobs via env vars: `ANTHROPIC_MODEL` (e.g. `claude-sonnet-5` to
 spend less), `DEEP_DIVE_COUNT`, `NEWSLETTER_TITLE`.

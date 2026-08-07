@@ -183,7 +183,7 @@ Scores a single issue on two tiers of metric:
   - `frac_topics_at_item_target` — topics that hit the item count.
 - **Judged** (LLM scores each topic against a rubric):
   - `note_quality`, `curation_quality`, `topic_interest`, each **0–10** (see §6 on why 0–10).
-  - Judge = **Opus** (`EVAL_JUDGE_MODEL`, default `claude-opus-4-8`) — a *stronger* model
+  - Judge = **Opus** (`EVAL_JUDGE_MODEL`, default `claude-opus-5`) — a *stronger* model
     than the Sonnet that writes issues, so it isn't grading its own work.
   - **Single pass per topic.** The eval calls the judge once per topic (the multi-pass runs
     you may see referenced were a one-off noise-measurement probe, not the real eval).
@@ -274,8 +274,8 @@ These are the non-obvious things that cost real debugging. Don't undo them witho
 **Secrets / delivery:** `ANTHROPIC_API_KEY`, `RESEND_API_KEY`, `NEWSLETTER_TO`,
 `NEWSLETTER_FROM`.
 
-**Models & basics:** `ANTHROPIC_MODEL` (writer; currently `claude-sonnet-4-6` to save
-tokens), `EVAL_JUDGE_MODEL` (judge; `claude-opus-4-8`), `DATA_DIR`, `NEWSLETTER_TITLE`,
+**Models & basics:** `ANTHROPIC_MODEL` (writer; currently `claude-sonnet-5` to save
+tokens), `EVAL_JUDGE_MODEL` (judge; `claude-opus-5`), `DATA_DIR`, `NEWSLETTER_TITLE`,
 `DEEP_DIVE_COUNT` (topics per issue).
 
 **Search depth / curation (all tunable, no code change):**

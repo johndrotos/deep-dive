@@ -97,8 +97,8 @@ class Config:
             resend_api_key=resend_api_key,
             newsletter_to=newsletter_to,
             newsletter_from=newsletter_from,
-            model=os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8").strip()
-            or "claude-opus-4-8",
+            model=os.environ.get("ANTHROPIC_MODEL", "claude-opus-5").strip()
+            or "claude-opus-5",
             data_dir=os.environ.get("DATA_DIR", "./data").strip() or "./data",
             deep_dive_count=deep_dive_count,
             topic_candidates=int_env("TOPIC_CANDIDATES", 5, minimum=1),
@@ -111,6 +111,6 @@ class Config:
             research_dynamic_filtering=bool_env("SEARCH_DYNAMIC_FILTERING", False),
             research_candidate_items=int_env("SEARCH_CANDIDATE_ITEMS", 6, minimum=2),
             deep_dive_items=int_env("DEEP_DIVE_ITEMS", 4, minimum=1),
-            eval_judge_model=os.environ.get("EVAL_JUDGE_MODEL", "claude-opus-4-8").strip()
-            or "claude-opus-4-8",
+            eval_judge_model=os.environ.get("EVAL_JUDGE_MODEL", "claude-opus-5").strip()
+            or "claude-opus-5",
         )
