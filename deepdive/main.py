@@ -15,8 +15,10 @@ import argparse
 import json
 import os
 import sys
+import traceback
 import webbrowser
 from datetime import datetime
+from html import escape
 
 from . import curator, history, mailer, renderer
 from .config import Config, ConfigError
@@ -92,6 +94,31 @@ def _build(cfg: Config) -> Newsletter:
     return newsletter
 
 
+def _alert_failure(cfg: Config, exc: BaseException) -> None:
+    """Best-effort "the weekly run died" email.
+
+    An unattended cron run has no other way to surface a failure: a crash just means
+    no newsletter arrives, which looks exactly like a week you forgot about. Errors
+    raised in here are swallowed so they can never mask the original exception.
+    """
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    try:
+        mailer.send(
+            api_key=cfg.resend_api_key,
+            sender=cfg.newsletter_from,
+            recipient=cfg.newsletter_to,
+            subject=f"{cfg.newsletter_title} — this week's issue failed to build",
+            html=(
+                "<p>The weekly run did not produce an issue.</p>"
+                f"<p><b>{escape(type(exc).__name__)}: {escape(str(exc))}</b></p>"
+                f"<pre style='white-space:pre-wrap;font:12px monospace'>{escape(detail)}</pre>"
+            ),
+        )
+        print("Sent a failure notification.", file=sys.stderr)
+    except Exception as alert_exc:  # pragma: no cover - alerting is best-effort
+        print(f"Could not send failure notification: {alert_exc}", file=sys.stderr)
+
+
 def run(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="deepdive", description="The Deep Dive newsletter agent.")
     parser.add_argument(
@@ -140,6 +167,17 @@ def run(argv: list[str] | None = None) -> int:
         return 2
 
     print(f"The Deep Dive — building this week's issue with {cfg.model}.")
+    # Dry runs and evals are interactive: the traceback on the terminal is the alert.
+    alert_on_failure = not (args.dry_run or args.eval)
+    try:
+        return _run_issue(cfg, args)
+    except Exception as exc:
+        if alert_on_failure:
+            _alert_failure(cfg, exc)
+        raise
+
+
+def _run_issue(cfg: Config, args: argparse.Namespace) -> int:
     newsletter = _build(cfg)
     html = renderer.render_html(newsletter, cfg.newsletter_title)
     subject = renderer.subject_line(newsletter, cfg.newsletter_title)

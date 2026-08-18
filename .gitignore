@@ -1,4 +1,7 @@
-data/
+# Topic history is tracked so the weekly CI run can commit it back and
+# remember what's already been covered. Everything else in data/ is local.
+data/*
+!data/history.json
 out/
 .env
 __pycache__/

@@ -8,8 +8,8 @@ written like a knowledgeable friend pointed you at the best stuff.
 - **LLM:** Anthropic Claude (`claude-opus-5`)
 - **Real links:** Claude curates with live **web search**, so URLs are real, not invented
 - **Email:** Resend
-- **Runs itself:** Railway cron, every Sunday ~8am
-- **No repeats:** past topics are remembered on a persistent volume
+- **Runs itself:** GitHub Actions cron, every Sunday 8am ET
+- **No repeats:** past topics are committed back to `data/history.json` each week
 
 ---
 
@@ -69,21 +69,31 @@ Curates, emails you, and records the topics so next week won't repeat them.
 
 ---
 
-## Deploy to Railway (runs automatically every week)
+## Deploy (runs automatically every week)
 
-1. Push this repo to GitHub and create a new Railway project from it.
-2. **Add a Volume** to the service, mounted at `/data` (this stores topic history so
-   weeks don't repeat across deploys).
-3. **Set environment variables** (Railway → Variables) from `.env.example`:
-   - `ANTHROPIC_API_KEY`, `RESEND_API_KEY`, `NEWSLETTER_TO`, `NEWSLETTER_FROM`
-   - `DATA_DIR=/data`
-4. The schedule is already declared in `railway.json` as `0 8 * * 0`
-   (Sunday 08:00 UTC). Railway runs the service on that cron, it builds the issue,
-   emails you, and exits.
+Runs on **GitHub Actions** — `.github/workflows/weekly.yml`.
 
-To change the day/time, edit `cronSchedule` in `railway.json` (UTC).
-To test the deployed version on demand, trigger the cron service manually from the
-Railway dashboard.
+1. Push this repo to GitHub (private is fine; `.env` is gitignored).
+2. **Settings → Secrets and variables → Actions → New repository secret**, add four:
+   `ANTHROPIC_API_KEY`, `RESEND_API_KEY`, `NEWSLETTER_TO`, `NEWSLETTER_FROM`.
+   Everything else (model, search depth, item counts) is non-secret and set inline
+   in the workflow.
+3. **Actions tab → Weekly Deep Dive → Run workflow**, with **dry run** checked. This
+   builds a real issue without emailing and uploads `preview.html` as an artifact —
+   the cheapest way to confirm the deploy works. Then run it again unchecked to send.
+
+The schedule is `0 12 * * 0` — Sunday 08:00 EDT (07:00 once EST starts; cron has no
+timezone). Change the `cron:` line to move it.
+
+**Topic history** lives in `data/history.json`, which is *tracked in git*: after each
+live run the workflow commits it back, so the next week knows what's already been
+covered. That also gives you a readable log of every issue ever sent.
+
+**If a run fails**, it emails you the exception and traceback instead of failing
+silently — an unattended crash otherwise just looks like a week with no newsletter.
+
+> `railway.json` is left in the repo as an alternative host. Railway needs a Volume
+> mounted at `/data` and `DATA_DIR=/data`, since it has no repo to commit history to.
 
 ---
 
