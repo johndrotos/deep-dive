@@ -267,6 +267,13 @@ These are the non-obvious things that cost real debugging. Don't undo them witho
    have ignored). Lesson recorded: validate the base pipeline over several runs before
    layering features that need careful false-positive tuning.
 
+9. **Declare every direct dependency, and cap the majors.** `requirements.txt` listed
+   `anthropic>=0.113` with no upper bound and never listed `httpx`, which `verify.py`
+   imports — it arrived transitively via `anthropic` 0.x. `anthropic` 1.0.0 (2026-08-20)
+   switched its HTTP layer to the `httpx2` fork, so CI stopped installing `httpx` and every
+   scheduled run died at import in ~1s. Three weeks of issues were missed. CI installs fresh
+   each week, so an unpinned major is a scheduled outage waiting to happen.
+
 ---
 
 ## 7. Configuration (all via `.env`; see `.env.example`)
@@ -341,10 +348,20 @@ only deliver to the account owner's own Gmail. The intended domain
 (`johnsdeepdive.com`) is **not registered** — to send to anyone else, a real domain must be
 registered and verified in Resend, then `NEWSLETTER_FROM` pointed at it.
 
+**Deployment status:** deployed on **GitHub Actions** (`.github/workflows/weekly.yml`), not
+Railway — cron `0 12 * * 0` (Sunday 08:00 EDT), secrets in repo settings, tuning env vars
+inline in the workflow. History is committed back to `data/history.json` by the run itself,
+which is why the repo (not a volume) is the store. `railway.json` is kept only as an
+alternative host; it needs a volume at `/data` and `DATA_DIR=/data` if ever used.
+
 **Known issues / not done:**
 - **0-item structuring bug (open):** `structure_deep_dive` occasionally returns 0 items from
   a good brief → an empty topic ships. Not yet fixed (a retry guard is the intended fix).
-- **Not deployed:** runs locally only; no Railway, no cron.
+- **Failure alerting has a hole (open):** `_alert_failure` only covers exceptions raised
+  *inside* `run()`. Anything that fails earlier — an import error, a bad dependency — exits
+  before the alert can fire, so the run dies silently. This is exactly how the `httpx`
+  breakage (§6.9) went unnoticed for three weeks; a workflow-level `if: failure()` notify
+  step is the intended fix.
 - **Content-match:** removed (see §6.8).
 
 ---
@@ -354,9 +371,11 @@ registered and verified in Resend, then `NEWSLETTER_FROM` pointed at it.
 1. **Quality (Goal 1) — in progress.** Have: over-provision+select, verification, the eval
    scorecard, the A/B harness, the 0–10 judge. Open ideas: research-prompt tweak for format
    diversity; the 0-item guard; possibly re-baselining effort/model with the now-trustworthy eval.
-2. **Deploy (Goal 2).** Register + verify a domain; Railway with a persistent volume for
-   history and a weekly cron; failure alerting. Design it with Goal 3 in mind (a feedback
-   web endpoint may mean deploying a small always-on service, not just a cron).
+2. **Deploy (Goal 2) — mostly done.** The weekly cron runs on GitHub Actions (see §10).
+   Remaining: register + verify a real domain so sending isn't limited to the owner's own
+   inbox, and close the failure-alerting hole (§10). Keep Goal 3 in mind — a feedback web
+   endpoint may mean a small always-on service, which is where `railway.json` would earn
+   its place.
 3. **Feedback (Goal 3).** Start with the cheap, serverless slice — standing preferences
    ("more history, less politics") fed into topic selection, or reply-to-train via the Gmail
    API — which doubles as the per-user preference system multi-user needs.
