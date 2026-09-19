@@ -145,7 +145,11 @@ jobs:
           )
           try:
               with urllib.request.urlopen(req, timeout=30) as resp:
-                  print(f"Alert sent ({resp.status}).")
+                  # "Accepted", not "sent": a 200 means Resend took the message, not
+                  # that it reached an inbox. Print the id so it can be looked up in
+                  # the Resend dashboard to see what actually happened to it.
+                  payload = resp.read().decode("utf-8", "replace")[:200]
+                  print(f"Alert accepted by Resend ({resp.status}): {payload}")
           except urllib.error.HTTPError as exc:
               print(f"Alert failed: HTTP {exc.code} {exc.read()[:300]!r}")
           except Exception as exc:
