@@ -41,6 +41,116 @@ _RETRYABLE = (
 _BACKOFF_SECONDS = (5, 15, 40)
 
 
+# --- Cost accounting ---------------------------------------------------------
+#
+# Every response carries a `usage` object; without somewhere to put it the only
+# cost signal is a Console page that reports the whole org and cannot say what one
+# issue cost. The ledger accumulates usage per stage so a run can price itself, and
+# so DEPTH / model / effort changes become measurable instead of arguable.
+
+# USD per million tokens. Published rates, checked 2026-09-19:
+# https://platform.claude.com/docs/en/about-claude/pricing
+# A model missing from this table is still counted in tokens but never priced — a
+# model swap must not quietly produce a confident wrong dollar figure.
+_RATES_USD_PER_MTOK = {
+    "claude-opus-5":     {"input": 5.00, "output": 25.00, "cache_write": 6.25, "cache_read": 0.50},
+    "claude-opus-4-8":   {"input": 5.00, "output": 25.00, "cache_write": 6.25, "cache_read": 0.50},
+    "claude-sonnet-5":   {"input": 2.00, "output": 10.00, "cache_write": 2.50, "cache_read": 0.20},
+    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30},
+    "claude-haiku-4-5":  {"input": 1.00, "output":  5.00, "cache_write": 1.25, "cache_read": 0.10},
+}
+
+# $10 per 1,000 searches, billed on top of the tokens the results occupy. Web fetch
+# and (alongside search) code execution add no charge beyond tokens.
+_WEB_SEARCH_USD = 10.0 / 1000
+_TOKEN_FIELDS = ("input", "output", "cache_write", "cache_read")
+
+
+class UsageLedger:
+    """Per-run token and dollar accounting, broken down by pipeline stage.
+
+    Topics research in parallel, so every mutation takes the lock. Rows are keyed by
+    (stage, model) because the judge deliberately runs on a pricier model than the
+    writer, and blending them would hide that.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._rows: dict = {}
+
+    def record(self, stage: str, model: str, usage) -> None:
+        """Add one response's usage. Tolerates missing fields: a usage object that
+        lacks a counter contributes zero rather than breaking the run."""
+        if usage is None:
+            return
+        server = getattr(usage, "server_tool_use", None)
+        counts = {
+            "input": getattr(usage, "input_tokens", 0) or 0,
+            "output": getattr(usage, "output_tokens", 0) or 0,
+            "cache_write": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            "cache_read": getattr(usage, "cache_read_input_tokens", 0) or 0,
+            "searches": getattr(server, "web_search_requests", 0) or 0,
+            "calls": 1,
+        }
+        with self._lock:
+            row = self._rows.setdefault(
+                (stage, model), {k: 0 for k in (*_TOKEN_FIELDS, "searches", "calls")}
+            )
+            for key, value in counts.items():
+                row[key] += value
+
+    @staticmethod
+    def _row_cost(model: str, row: dict) -> Optional[float]:
+        """USD for one row, or None when the model has no published rate here."""
+        rates = _RATES_USD_PER_MTOK.get(model)
+        if rates is None:
+            return None
+        tokens_usd = sum(row[f] * rates[f] for f in _TOKEN_FIELDS) / 1_000_000
+        return tokens_usd + row["searches"] * _WEB_SEARCH_USD
+
+    def rows(self) -> List[dict]:
+        """One dict per (stage, model), most expensive first."""
+        with self._lock:
+            snapshot = {k: dict(v) for k, v in self._rows.items()}
+        out = [
+            {"stage": stage, "model": model, "usd": self._row_cost(model, row), **row}
+            for (stage, model), row in snapshot.items()
+        ]
+        out.sort(key=lambda r: (r["usd"] is None, -(r["usd"] or 0)))
+        return out
+
+    def total_usd(self) -> Optional[float]:
+        """Total spend, or None if any row used a model with no rate on file."""
+        rows = self.rows()
+        if not rows or any(r["usd"] is None for r in rows):
+            return None
+        return sum(r["usd"] for r in rows)
+
+    def to_dict(self) -> dict:
+        return {"total_usd": self.total_usd(), "rows": self.rows()}
+
+    def report(self) -> str:
+        """A costed breakdown, most expensive stage first."""
+        rows = self.rows()
+        if not rows:
+            return "  No API usage recorded."
+        head = (
+            f"  {'stage':<15}{'model':<18}{'calls':>6}{'input':>10}"
+            f"{'output':>9}{'search':>7}{'USD':>9}"
+        )
+        lines = [head, "  " + "-" * (len(head) - 2)]
+        for r in rows:
+            usd = f"${r['usd']:.4f}" if r["usd"] is not None else "unpriced"
+            lines.append(
+                f"  {r['stage']:<15}{r['model']:<18}{r['calls']:>6}{r['input']:>10,}"
+                f"{r['output']:>9,}{r['searches']:>7}{usd:>9}"
+            )
+        total = self.total_usd()
+        total_str = f"${total:.4f}" if total is not None else "partial (unpriced model)"
+        lines.append(f"  {'TOTAL':<15}{'':<18}{'':>6}{'':>10}{'':>9}{'':>7}{total_str:>9}")
+        return "\n".join(lines)
+
+
 # --- Effort policy: how hard each stage thinks -------------------------------
 #
 # `max_tokens` is a hard cap on thinking PLUS answer text, and current models (Sonnet 5,
@@ -162,6 +272,7 @@ def _structured(
     output_format,
     depth: str = DEFAULT_DEPTH,
     label: str = "",
+    ledger: "Optional[UsageLedger]" = None,
 ):
     """One structured-output call under its stage policy, with truncation named.
 
@@ -184,6 +295,10 @@ A cut-off response reaches us two ways - ``parsed_output is None`` when no text 
             )
         except ValidationError as exc:
             raise _invalid_json_error(stage, exc) from exc
+        if ledger is not None:
+            # Record before the None check: a truncated call still costs money, and
+            # a cost report that omits failed attempts understates the real bill.
+            ledger.record(stage, model, getattr(response, "usage", None))
         parsed = getattr(response, "parsed_output", None)
         if parsed is None:
             raise _no_output_error(stage, response)
@@ -278,6 +393,7 @@ def select_topics(
     history: List[str],
     count: int,
     depth: str = DEFAULT_DEPTH,
+    ledger: "Optional[UsageLedger]" = None,
 ) -> List[_TopicIdea]:
     avoid = "\n".join(f"- {t}" for t in history) if history else "(nothing yet)"
     user = (
@@ -289,7 +405,7 @@ def select_topics(
     )
     slate = _structured(
         client, model, "select_topics", _TOPIC_SYSTEM, user, _TopicSlate,
-        depth=depth, label="topics",
+        depth=depth, label="topics", ledger=ledger,
     )
     if not slate.topics:
         raise RuntimeError("Topic selection returned an empty slate.")
@@ -430,7 +546,7 @@ def _handle_stream_event(event, stream, state, searches, settings, label) -> int
     return searches
 
 
-def _stream_one_turn(client, model, messages, settings, label, container):
+def _stream_one_turn(client, model, messages, settings, label, container, ledger=None):
     """Stream a single research turn with granular, phase-level logging.
 
     We iterate the stream events so we can show what Claude is doing inside the turn:
@@ -470,6 +586,8 @@ def _stream_one_turn(client, model, messages, settings, label, container):
     finally:
         stop_event.set()
 
+    if ledger is not None:
+        ledger.record("research", model, getattr(final, "usage", None))
     out_tokens = getattr(getattr(final, "usage", None), "output_tokens", "?")
     _log(
         f"  {label}   turn complete: {searches} search(es), "
@@ -478,7 +596,7 @@ def _stream_one_turn(client, model, messages, settings, label, container):
     return final
 
 
-def _stream_with_backoff(client, model, messages, settings, label, container=None):
+def _stream_with_backoff(client, model, messages, settings, label, container=None, ledger=None):
     """One streamed research turn, retried with backoff on transient server errors.
 
     Streaming keeps the wire active so long jobs don't trip the read timeout; this loop
@@ -492,7 +610,9 @@ def _stream_with_backoff(client, model, messages, settings, label, container=Non
     last_exc = None
     for attempt in range(len(_BACKOFF_SECONDS) + 1):
         try:
-            return _stream_one_turn(client, model, messages, settings, label, container)
+            return _stream_one_turn(
+                client, model, messages, settings, label, container, ledger
+            )
         except Exception as exc:  # noqa: BLE001 - re-raised below if not retryable
             if not (isinstance(exc, _RETRYABLE) or _is_overloaded(exc)):
                 raise
@@ -513,6 +633,7 @@ def research_topic(
     topic: _TopicIdea,
     settings: "ResearchSettings",
     label: str = "",
+    ledger: "Optional[UsageLedger]" = None,
 ) -> str:
     """Run a web-search-backed research pass; return Claude's rich markdown writeup.
 
@@ -540,7 +661,9 @@ def research_topic(
     for round_i in range(total_rounds):
         if total_rounds > 1:
             _log(f"  {label}   round {round_i + 1}/{total_rounds}...")
-        final = _stream_with_backoff(client, model, messages, settings, label, container)
+        final = _stream_with_backoff(
+            client, model, messages, settings, label, container, ledger
+        )
         if final.stop_reason == "pause_turn":
             # Server tool loop hit its cap; resend the assistant content (no extra
             # "continue" message — the API resumes from the trailing server_tool_use)
@@ -577,6 +700,7 @@ def structure_deep_dive(
     research: str,
     depth: str = DEFAULT_DEPTH,
     label: str = "",
+    ledger: "Optional[UsageLedger]" = None,
 ) -> DeepDive:
     user = (
         f"Topic title to use: {topic.title}\n\n"
@@ -586,7 +710,7 @@ def structure_deep_dive(
     try:
         return _structured(
             client, model, "structure", _STRUCTURE_SYSTEM, user, DeepDive,
-            depth=depth, label=label,
+            depth=depth, label=label, ledger=ledger,
         )
     except RuntimeError as exc:
         raise RuntimeError(f"Structuring failed for topic {topic.title!r}: {exc}") from exc
@@ -618,6 +742,7 @@ def select_deep_dive(
     final_items: int,
     label: str = "",
     depth: str = DEFAULT_DEPTH,
+    ledger: "Optional[UsageLedger]" = None,
 ) -> DeepDive:
     """Pick the best ``final_items`` from a verified DeepDive's candidates.
 
@@ -645,7 +770,7 @@ def select_deep_dive(
     try:
         sel = _structured(
             client, model, "select_items", _SELECT_SYSTEM, user, _Selection,
-            depth=depth, label=label,
+            depth=depth, label=label, ledger=ledger,
         )
     except Exception as exc:  # noqa: BLE001 - fall back to research order on any failure
         _log(f"  {label}   selection call failed ({type(exc).__name__}: {exc}); keeping first {final_items}")
@@ -700,6 +825,7 @@ def rank_topics_by_richness(
     keep: int,
     label: str = "",
     depth: str = DEFAULT_DEPTH,
+    ledger: "Optional[UsageLedger]" = None,
 ) -> List[DeepDive]:
     """Keep the ``keep`` richest researched topics, judged by a stronger (Opus) model.
 
@@ -729,7 +855,7 @@ def rank_topics_by_richness(
     try:
         ranking = _structured(
             client, judge_model, "rank_topics", _TOPIC_RANK_SYSTEM, user, _TopicRanking,
-            depth=depth, label=label,
+            depth=depth, label=label, ledger=ledger,
         )
     except Exception as exc:  # noqa: BLE001 - fall back to research order on any failure
         _log(f"  {label}   topic-rank call failed ({type(exc).__name__}: {exc}); keeping first {keep}")
@@ -767,6 +893,7 @@ def _edition_intro(
     model: str,
     dives: List[DeepDive],
     depth: str = DEFAULT_DEPTH,
+    ledger: "Optional[UsageLedger]" = None,
 ) -> str:
     titles = "; ".join(d.title for d in dives)
 
@@ -784,6 +911,8 @@ def _edition_intro(
                 }
             ],
         )
+        if ledger is not None:
+            ledger.record("edition_intro", model, getattr(response, "usage", None))
         if getattr(response, "stop_reason", None) == "max_tokens":
             raise TruncatedError("edition_intro: hit max_tokens before finishing the note")
         return "".join(b.text for b in response.content if b.type == "text").strip()
@@ -803,17 +932,20 @@ def _research_and_structure(
     topic: _TopicIdea,
     settings: "ResearchSettings",
     label: str,
+    ledger: "Optional[UsageLedger]" = None,
 ) -> DeepDive:
     """Full per-topic pipeline (research -> structure). One unit of parallel work."""
     _log(f"  {label} researching '{topic.title}'...")
-    brief = research_topic(client, model, topic, settings, label)
+    brief = research_topic(client, model, topic, settings, label, ledger)
     _log(f"  {label}   structuring brief into a deep dive...")
-    dive = structure_deep_dive(client, model, topic, brief, settings.depth, label)
+    dive = structure_deep_dive(
+        client, model, topic, brief, settings.depth, label, ledger
+    )
     _log(f"  {label}   verifying {len(dive.items)} candidate links...")
     dive = verify.verify_dive(dive, label)
     _log(f"  {label}   selecting best {settings.final_items} of {len(dive.items)}...")
     dive = select_deep_dive(
-        client, model, dive, settings.final_items, label, settings.depth
+        client, model, dive, settings.final_items, label, settings.depth, ledger
     )
     _log(f"  {label} done: {topic.title} ({len(dive.items)} items)")
     return dive
@@ -833,6 +965,7 @@ def build_newsletter(
     judge_model: str,
     topics: "Optional[List[_TopicIdea]]" = None,
     topic_candidates: "Optional[int]" = None,
+    ledger: "Optional[UsageLedger]" = None,
 ) -> Newsletter:
     """Run the full pipeline and return a finished Newsletter.
 
@@ -841,10 +974,15 @@ def build_newsletter(
     Opus ``judge_model`` keeps the richest ``count``. If ``topics`` is given (fixed-topics
     mode, for A/B experiments), those are researched verbatim and none are filtered.
     """
+    # A run always accounts for itself; the caller passes one in when it wants to
+    # keep the numbers (main writes them into issue.json for the eval harness).
+    ledger = ledger if ledger is not None else UsageLedger()
     topics_selected_fresh = topics is None
     if topics_selected_fresh:
         n_candidates = topic_candidates or count
-        topics = select_topics(client, model, history, n_candidates, settings.depth)
+        topics = select_topics(
+            client, model, history, n_candidates, settings.depth, ledger
+        )
         _log("  Topics chosen:")
     else:
         _log("  Topics (fixed):")
@@ -869,6 +1007,7 @@ def build_newsletter(
                 topic,
                 settings,
                 f"[{i}/{total}]",
+                ledger,
             ): i
             for i, topic in enumerate(topics, 1)
         }
@@ -889,11 +1028,14 @@ def build_newsletter(
     if topics_selected_fresh and len(dives) > count:
         _log(f"  Judging {len(dives)} researched topics; keeping the best {count}...")
         dives = rank_topics_by_richness(
-            client, judge_model, dives, count, depth=settings.depth
+            client, judge_model, dives, count, depth=settings.depth, ledger=ledger
         )
 
     _log("  Writing the editor's note...")
-    intro = _edition_intro(client, model, dives, settings.depth)
+    intro = _edition_intro(client, model, dives, settings.depth, ledger)
+    _log("  What this issue cost:")
+    for line in ledger.report().splitlines():
+        _log(line)
     return Newsletter(
         edition_date=date.today().strftime("%A, %B %-d, %Y"),
         intro=intro,

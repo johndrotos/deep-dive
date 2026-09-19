@@ -36,13 +36,16 @@ def _write_preview(html: str) -> str:
     return os.path.abspath(_PREVIEW_PATH)
 
 
-def _write_issue_json(newsletter: Newsletter, cfg: Config, settings) -> str:
+def _write_issue_json(newsletter: Newsletter, cfg: Config, settings, usage=None) -> str:
     """Persist the structured issue + the settings that produced it, for the evaluator."""
     os.makedirs(os.path.dirname(_ISSUE_PATH), exist_ok=True)
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "model": cfg.model,
         "settings": settings.model_dump(),
+        # What the issue cost to produce, per stage. Persisted so the A/B harness can
+        # compare variants on price as well as quality.
+        "usage": usage.to_dict() if usage is not None else None,
         "newsletter": newsletter.model_dump(),
     }
     with open(_ISSUE_PATH, "w", encoding="utf-8") as fh:
@@ -87,13 +90,14 @@ def _build(cfg: Config) -> Newsletter:
         f"candidates, verify, then select the best {settings.final_items}."
     )
     print("  Selecting topics and researching (this takes a few minutes)...")
+    usage = curator.UsageLedger()
     newsletter = curator.build_newsletter(
         client, cfg.model, past, cfg.deep_dive_count, settings,
-        cfg.eval_judge_model, topic_candidates=cfg.topic_candidates,
+        cfg.eval_judge_model, topic_candidates=cfg.topic_candidates, ledger=usage,
     )
     for dive in newsletter.deep_dives:
         print(f"    - {dive.title} ({len(dive.items)} items)")
-    _write_issue_json(newsletter, cfg, settings)
+    _write_issue_json(newsletter, cfg, settings, usage)
     return newsletter
 
 

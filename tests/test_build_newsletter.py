@@ -38,12 +38,13 @@ class _FakeClient:
 def test_overprovisions_five_then_ships_three(monkeypatch):
     captured = {}
 
-    def fake_select(client, model, history, count, depth="balanced"):
+    def fake_select(client, model, history, count, depth="balanced", ledger=None):
         captured["candidate_count"] = count
         captured["depth"] = depth
         return [make_topic(f"T{i}", "angle") for i in range(count)]
 
-    def fake_research(client, model, topic, settings, label):
+    def fake_research(client, model, topic, settings, label, ledger=None):
+        captured["ledger_reached_research"] = ledger is not None
         return _dive(topic.title)
 
     monkeypatch.setattr(curator, "select_topics", fake_select)
@@ -59,6 +60,7 @@ def test_overprovisions_five_then_ships_three(monkeypatch):
 
     assert captured["candidate_count"] == 5           # over-provisioned
     assert captured["depth"] == "balanced"            # profile reaches the stages
+    assert captured["ledger_reached_research"]        # cost accounting reaches the stages
     assert len(nl.deep_dives) == 3                     # filtered to count
     assert [d.title for d in nl.deep_dives] == ["T0", "T1", "T2"]
     assert nl.intro == "intro"
@@ -66,7 +68,7 @@ def test_overprovisions_five_then_ships_three(monkeypatch):
 
 def test_fixed_topics_mode_does_not_filter(monkeypatch):
     # When topics are passed in (A/B mode), research them all and ship them all.
-    def fake_research(client, model, topic, settings, label):
+    def fake_research(client, model, topic, settings, label, ledger=None):
         return _dive(topic.title)
 
     monkeypatch.setattr(curator, "_research_and_structure", fake_research)
