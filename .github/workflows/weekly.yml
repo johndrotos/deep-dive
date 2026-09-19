@@ -79,3 +79,75 @@ jobs:
             git commit -m "Record issue topics for $(date -u +%Y-%m-%d)"
             git push
           fi
+
+      # The outer net, and deliberately the LAST step so it observes every one before
+      # it — including the history commit/push, which would otherwise fail after the
+      # alert had already been skipped.
+      # `_alert_failure` in main.py only covers exceptions raised
+      # *inside* run(), so everything that kills the job earlier or outside it has
+      # always been silent: an import error or a bad dependency (exactly how three
+      # issues were missed between 2026-08-23 and 09-06), a ConfigError that exits
+      # before the mailer exists, a failed `pip install`, or the 20-minute timeout.
+      # `if: failure()` sees all of them, because GitHub knows the job died whatever
+      # the reason. An in-run failure now sends two emails - the app's, with the
+      # traceback, and this one, with the run URL. That duplication is deliberate:
+      # the alternative is a gap, and a gap is what we are fixing.
+      - name: Alert that the run failed
+        if: failure()
+        continue-on-error: true  # an alert that fails must not rewrite the real cause
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          NEWSLETTER_TO: ${{ secrets.NEWSLETTER_TO }}
+          NEWSLETTER_FROM: ${{ secrets.NEWSLETTER_FROM }}
+          NEWSLETTER_TITLE: The Deep Dive
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRIGGER: ${{ github.event_name }}
+        # python3 is preinstalled on the runner, so this works even when the
+        # setup-python step is what failed. No third-party imports for the same reason.
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+
+          key = os.environ.get("RESEND_API_KEY", "").strip()
+          to = os.environ.get("NEWSLETTER_TO", "").strip()
+          sender = os.environ.get("NEWSLETTER_FROM", "").strip()
+          title = os.environ.get("NEWSLETTER_TITLE", "The Deep Dive")
+          run_url = os.environ.get("RUN_URL", "")
+          trigger = os.environ.get("TRIGGER", "unknown")
+
+          if not (key and to and sender):
+              print("Cannot alert: RESEND_API_KEY / NEWSLETTER_TO / NEWSLETTER_FROM not all set.")
+              sys.exit(0)
+
+          body = {
+              "from": sender,
+              "to": [to],
+              "subject": f"{title} \u2014 the weekly job failed",
+              "html": (
+                  "<p>The weekly GitHub Actions run failed, so no issue was produced.</p>"
+                  f"<p>Trigger: <code>{trigger}</code></p>"
+                  f'<p><a href="{run_url}">Open the run log</a></p>'
+                  "<p>If no separate email arrived with a Python traceback, the run died "
+                  "before the pipeline started \u2014 check the setup and install steps.</p>"
+              ),
+          }
+          req = urllib.request.Request(
+              "https://api.resend.com/emails",
+              data=json.dumps(body).encode(),
+              headers={
+                  "Authorization": f"Bearer {key}",
+                  "Content-Type": "application/json",
+                  # Resend sits behind Cloudflare, which 403s urllib's default
+                  # User-Agent (error 1010). Verified: without this the alert never
+                  # reaches the API.
+                  "User-Agent": "deep-dive-failure-alert/1.0",
+              },
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  print(f"Alert sent ({resp.status}).")
+          except urllib.error.HTTPError as exc:
+              print(f"Alert failed: HTTP {exc.code} {exc.read()[:300]!r}")
+          except Exception as exc:
+              print(f"Alert failed: {type(exc).__name__}: {exc}")
+          PY

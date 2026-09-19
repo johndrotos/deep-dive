@@ -341,6 +341,19 @@ These are the non-obvious things that cost real debugging. Don't undo them witho
     missed all of it because the fakes returned a canned `parsed_output` with no
     `stop_reason`.
 
+11. **Alert from the outermost layer that can see the failure.** `_alert_failure` lives
+    inside `run()`, so it can only report failures that `run()` is alive to catch. Every
+    other way the job can die — an import error (§6.9), a `ConfigError` that returns
+    before `cfg` exists, a failed `pip install`, the job timeout, a failed history push —
+    was silent, and silence looks exactly like a week nobody wrote an issue. The fix is a
+    workflow-level `if: failure()` step, which fires whatever the cause because GitHub
+    knows the job failed. Two details that only surfaced by *running* it rather than
+    reading it: it must be the **last** step, or a later step's failure happens after the
+    alert was already skipped; and Resend sits behind Cloudflare, which 403s urllib's
+    default `Python-urllib/3.x` User-Agent (error 1010), so the alert silently never
+    reached the API until a real User-Agent was set — an alerting path that fails quietly
+    is worse than none, because you believe you are covered.
+
 ---
 
 ## 7. Configuration (all via `.env`; see `.env.example`)
@@ -427,11 +440,11 @@ alternative host; it needs a volume at `/data` and `DATA_DIR=/data` if ever used
   occasionally returned 0 items from a good brief → an empty topic ships. A truncated
   response is a plausible cause, and §4a now catches and retries exactly that; whether it
   was *the* cause is unverified — watch for a recurrence before closing this out.
-- **Failure alerting has a hole (open):** `_alert_failure` only covers exceptions raised
-  *inside* `run()`. Anything that fails earlier — an import error, a bad dependency — exits
-  before the alert can fire, so the run dies silently. This is exactly how the `httpx`
-  breakage (§6.9) went unnoticed for three weeks; a workflow-level `if: failure()` notify
-  step is the intended fix.
+- **Failure alerting (closed 2026-09-19):** `_alert_failure` still only covers exceptions
+  raised *inside* `run()`, but `weekly.yml` now ends with an `if: failure()` step that
+  emails via Resend whatever killed the job — an import error, a `ConfigError` that exits
+  before the mailer exists, a failed `pip install`, the 20-minute timeout, or a failed
+  history push. See §6.11.
 - **Content-match:** removed (see §6.8).
 
 ---
