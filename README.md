@@ -117,6 +117,9 @@ railway.json     start command + weekly cron
 ## Cost & tuning
 
 One run a week, so cost is small (roughly cents to a couple dollars depending on how much
-the model searches). Knobs via env vars: `DEPTH` (`fast` / `balanced` / `deep` — one dial
-for how hard every stage thinks, and the main cost lever), `ANTHROPIC_MODEL`,
-`DEEP_DIVE_COUNT`, `NEWSLETTER_TITLE`.
+the model searches). A measured issue runs **~$1.44** (see ARCHITECTURE §4b); every run
+prints its own costed breakdown. The dominant cost is web search — each search bills a
+cent and then drags ~18k input tokens of results behind it — so `SEARCH_MAX_USES` and
+`TOPIC_CANDIDATES` are the real money knobs. `DEPTH` (`fast`/`balanced`/`deep`) moves
+reasoning effort, which is a quality dial with only a small cost effect. Other knobs:
+`ANTHROPIC_MODEL`, `DEEP_DIVE_COUNT`, `NEWSLETTER_TITLE`.

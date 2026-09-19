@@ -210,6 +210,43 @@ Research streams with `thinking={"type": "adaptive", "display": "summarized"}` r
 the `"omitted"` default: the summaries keep the wire active and surface long reasoning
 phases in the log, instead of the silent gap that used to look like a stalled connection.
 
+### 4b. What an issue costs, and where
+
+Every run accumulates `usage` per stage in `curator.UsageLedger` and prints a costed
+breakdown; `main` persists it into `data/issue.json` so the A/B harness can compare
+variants on price as well as quality. Rates live in `_RATES_USD_PER_MTOK` with the date
+they were checked — **a model absent from that table is counted in tokens but never
+priced**, so a model swap cannot produce a confident wrong number.
+
+Measured 2026-09-19, `claude-sonnet-5`, `DEPTH=balanced`, 5 candidate topics → 3 shipped:
+
+| stage | calls | input | output | searches | USD |
+|---|---|---|---|---|---|
+| research | 5 | 409,480 | 21,010 | 23 | **$1.2591** |
+| structure | 5 | 20,326 | 8,545 | 0 | $0.1261 |
+| select_topics | 1 | 1,604 | 2,456 | 0 | $0.0278 |
+| select_items | 5 | 6,030 | 173 | 0 | $0.0138 |
+| rank_topics (Opus judge) | 1 | 2,439 | 15 | 0 | $0.0126 |
+| edition_intro | 1 | 196 | 202 | 0 | $0.0024 |
+| **total** | | | | | **$1.4417** |
+
+**Research is 87% of the bill, and it is an input-token problem, not an output one.**
+Search-result tokens alone are $0.82 — 57% of the issue. The 23 searches add $0.23. All
+output across the entire pipeline is $0.32.
+
+Consequences worth remembering before optimizing the wrong thing:
+
+- `SEARCH_MAX_USES` is the dominant lever: each search costs a cent *and* drags roughly
+  18k input tokens behind it. 5 → 3 saves on the order of $0.50.
+- Over-provisioning has a visible price. Researching 5 topics to ship 3 discards ~$0.50
+  of research per issue — deliberate (it buys the judge real choice and survives dead
+  links), but now quantified rather than assumed.
+- **`DEPTH` is a quality dial, not a cost lever.** It moves thinking, thinking is output
+  tokens, and output is a fifth of the bill. An earlier version of the README claimed
+  otherwise; the measurement disproved it.
+- The Opus judge costs $0.0126. Its model choice is a quality decision with no meaningful
+  cost consequence.
+
 ---
 
 ## 5. The evaluation pipeline
