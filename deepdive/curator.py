@@ -386,13 +386,17 @@ def _heartbeat(stop_event: threading.Event, state: dict, label: str) -> None:
 
     This is what de-black-boxes the long gap: if the stream goes quiet (e.g. the model is
     running result-filtering code server-side), no events arrive — but this timer still
-    prints which phase we entered last and whether output tokens are growing, so we can
+    prints which phase we entered last and whether the model is still emitting, so we can
     tell "stuck filtering" from "slowly writing text."
+
+    Progress is measured in characters streamed, not tokens: the API reports usage in a
+    single `message_delta` at the very END of the turn, so a live token count is not
+    available at all (verified against the wire — the in-flight snapshot stays at 1).
     """
     while not stop_event.wait(15):
         _log(
             f"  {label}   …still working: phase='{state['phase']}', "
-            f"~{state['out_tokens']} output tokens so far"
+            f"~{state['chars']:,} chars streamed so far"
         )
 
 
@@ -401,11 +405,21 @@ def _handle_stream_event(event, stream, state, searches, settings, label) -> int
     etype = event.type
     if etype == "content_block_start":
         phase = _phase_name(event.content_block)
-        state["phase"] = phase
-        # Searches are logged in full (with query) at stop; announce the start of every
-        # *other* phase so the post-search tail stops being a black box.
-        if phase != "web search":
+        # Announce a phase only when it CHANGES. A cited brief is split into one text
+        # block per citation — 33 in one observed turn — and announcing every block
+        # start buried the searches and turn summaries under identical lines.
+        if phase != state["phase"] and phase != "web search":
+            # Searches are logged in full (with query) at stop, hence the exclusion.
             _log(f"  {label}     · entering: {phase}")
+        state["phase"] = phase
+    elif etype == "content_block_delta":
+        # The only live progress signal there is; see _heartbeat.
+        delta = getattr(event, "delta", None)
+        for attr in ("text", "thinking", "partial_json"):
+            chunk = getattr(delta, attr, None)
+            if chunk:
+                state["chars"] += len(chunk)
+                break
     elif etype == "content_block_stop":
         try:
             blocks = stream.current_message_snapshot.content
@@ -413,10 +427,6 @@ def _handle_stream_event(event, stream, state, searches, settings, label) -> int
             blocks = []
         if event.index < len(blocks):
             searches = _log_tool_block(blocks[event.index], searches, settings, label)
-    elif etype == "message_delta":
-        usage = getattr(event, "usage", None)
-        if usage is not None and getattr(usage, "output_tokens", None):
-            state["out_tokens"] = usage.output_tokens
     return searches
 
 
@@ -432,7 +442,7 @@ def _stream_one_turn(client, model, messages, settings, label, container):
     """
     extra = {"container": container} if container else {}
     searches = 0
-    state = {"phase": "starting", "out_tokens": 0}
+    state = {"phase": "starting", "chars": 0}
     stop_event = threading.Event()
     heartbeat = threading.Thread(
         target=_heartbeat, args=(stop_event, state, label), daemon=True
