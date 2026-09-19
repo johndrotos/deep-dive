@@ -44,7 +44,9 @@ jobs:
           DEEP_DIVE_COUNT: "3"
           TOPIC_CANDIDATES: "5"
           NEWSLETTER_TITLE: The Deep Dive
-          SEARCH_EFFORT: medium
+          # Pipeline-wide effort profile (fast | balanced | deep). Shifts every
+          # stage's reasoning effort a notch, research included.
+          DEPTH: balanced
           SEARCH_MAX_TOKENS: "8000"
           SEARCH_MAX_USES: "5"
           SEARCH_MAX_ROUNDS: "0"

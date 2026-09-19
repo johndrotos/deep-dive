@@ -165,6 +165,42 @@ three badly. Splitting keeps each reliable. Over-provisioning (step 2) + verify 
 select (5) together make the final page **dead-link-resilient**: dropping a bad link no
 longer shrinks a topic below target, because we select from a larger verified pool.
 
+### 4a. Effort policy: how hard each stage thinks
+
+Current models think by default, and `max_tokens` is a hard cap on **thinking plus answer**
+(§6.10 is the outage that taught us). So each stage declares two separate things in
+`curator._POLICY`:
+
+- **`effort`** — how much *judgment* the step deserves. The real dial. It does **not**
+  track output size: `structure` turns an already-researched brief into a long document
+  (little judgment, lots of text → `low` effort, the biggest rail), while `select_items`
+  weighs a dozen candidates to emit six integers (real judgment, tiny output → `medium`
+  effort, a small rail).
+- **`max_tokens`** — a safety rail with thinking headroom. Set loosely, never "tuned".
+
+| Stage | effort | rail | why |
+|---|---|---|---|
+| `select_topics` | `high` | 8000 | open-ended curation; the hardest judgment in the pipeline |
+| research | `medium` | `SEARCH_MAX_TOKENS` | tool-driven; its rail is a real content knob (brief length) |
+| `structure` | `low` | 16000 | mechanical transform of a brief; long output, little judgment |
+| `select_items` | `medium` | 4000 | quality/format/arc tradeoffs → a handful of indices |
+| `rank_topics` | `medium` | 4000 | same, on the Opus judge |
+| `edition_intro` | `low` | 2000 | short, light writing |
+
+`DEPTH` (`fast` / `balanced` / `deep`) shifts every row one notch along
+`low → medium → high → xhigh → max`, preserving their relative shape, so cost and
+thoroughness move together from a single knob.
+
+**Truncation is named and recovered, not swallowed.** `parse()` signals a cut-off response
+as `parsed_output is None`, which is indistinguishable from "the model had nothing to say".
+`curator._structured` inspects `stop_reason` and raises `TruncatedError` (vs. a refusal, vs.
+an unparseable body), and `_with_headroom` retries the stage **once** a notch lower in
+effort with a doubled rail — the one failure here that is mechanically recoverable.
+
+Research streams with `thinking={"type": "adaptive", "display": "summarized"}` rather than
+the `"omitted"` default: the summaries keep the wire active and surface long reasoning
+phases in the log, instead of the silent gap that used to look like a stalled connection.
+
 ---
 
 ## 5. The evaluation pipeline
@@ -274,6 +310,20 @@ These are the non-obvious things that cost real debugging. Don't undo them witho
    scheduled run died at import in ~1s. Three weeks of issues were missed. CI installs fresh
    each week, so an unpinned major is a scheduled outage waiting to happen.
 
+10. **A model ID is not a configuration value, and `max_tokens` is not a tuning knob.**
+    Swapping `claude-sonnet-4-6` → `claude-sonnet-5` (and `opus-4-8` → `opus-5`) flipped a
+    server-side default: on the old models a request that omits `thinking` runs *without*
+    thinking; on the new ones it runs adaptive thinking at `high` effort. `max_tokens` caps
+    thinking **plus** answer, so every call whose budget had been trimmed to the expected
+    answer (topic selection at 2000, the index picks at 500) began truncating mid-thought.
+    `parse()` reports that as `parsed_output is None`, not an exception — so topic
+    selection killed the 2026-09-13 issue with "returned no topics" (the model had said
+    plenty), while item selection and topic ranking just silently fell back. The fix is structural, not a
+    bigger number: **effort** is the per-stage intent dial, **`max_tokens`** is a loose rail
+    with thinking headroom, and truncation is caught by name and retried (§4a). The tests
+    missed all of it because the fakes returned a canned `parsed_output` with no
+    `stop_reason`.
+
 ---
 
 ## 7. Configuration (all via `.env`; see `.env.example`)
@@ -288,8 +338,9 @@ tokens), `EVAL_JUDGE_MODEL` (judge; `claude-opus-5`), `DATA_DIR`, `NEWSLETTER_TI
 **Search depth / curation (all tunable, no code change):**
 | Var | Meaning |
 |---|---|
+| `DEPTH` | pipeline-wide effort profile: `fast` / `balanced` / `deep`. Shifts **every** stage's reasoning effort one notch (§4a), research included |
 | `TOPIC_CANDIDATES` | candidate topics researched before the judge keeps the best `DEEP_DIVE_COUNT` (over-provision, default 5) |
-| `SEARCH_EFFORT` | reasoning effort per turn (low/medium/high) |
+| `SEARCH_EFFORT` | *deprecated* — pins research's per-turn effort and ignores `DEPTH`. Leave unset except to pin an A/B variant |
 | `SEARCH_MAX_TOKENS` | length cap on the brief (main speed lever) |
 | `SEARCH_MAX_USES` | web searches per turn |
 | `SEARCH_MAX_ROUNDS` | extra `pause_turn` continuation turns (0 = one turn) |
@@ -355,8 +406,10 @@ which is why the repo (not a volume) is the store. `railway.json` is kept only a
 alternative host; it needs a volume at `/data` and `DATA_DIR=/data` if ever used.
 
 **Known issues / not done:**
-- **0-item structuring bug (open):** `structure_deep_dive` occasionally returns 0 items from
-  a good brief → an empty topic ships. Not yet fixed (a retry guard is the intended fix).
+- **0-item structuring bug (possibly fixed, unconfirmed):** `structure_deep_dive`
+  occasionally returned 0 items from a good brief → an empty topic ships. A truncated
+  response is a plausible cause, and §4a now catches and retries exactly that; whether it
+  was *the* cause is unverified — watch for a recurrence before closing this out.
 - **Failure alerting has a hole (open):** `_alert_failure` only covers exceptions raised
   *inside* `run()`. Anything that fails earlier — an import error, a bad dependency — exits
   before the alert can fire, so the run dies silently. This is exactly how the `httpx`

@@ -11,7 +11,7 @@ def _cfg():
         anthropic_api_key="k", resend_api_key="r",
         newsletter_to="me@example.com", newsletter_from="dive@example.com",
         model="m", data_dir="./data", deep_dive_count=3, topic_candidates=5,
-        newsletter_title="The Deep Dive", research_effort="medium",
+        newsletter_title="The Deep Dive", depth="balanced", research_effort="medium",
         research_max_tokens=8000, research_max_uses=5, research_max_rounds=0,
         research_dynamic_filtering=False, research_candidate_items=6,
         deep_dive_items=4, eval_judge_model="j",

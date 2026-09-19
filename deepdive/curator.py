@@ -7,10 +7,13 @@ Pipeline per run:
 
 Splitting "research with tools" from "structure to schema" keeps each call reliable.
 
-Research is intentionally non-streaming and runs without extended thinking: a
-streaming + adaptive-thinking request goes silent on the wire during long server-side
-thinking, which trips read timeouts. Non-streaming requests are auto-retried by the SDK
-on timeout, so the pipeline self-heals from transient stalls.
+Every stage runs under an explicit effort policy (see "Effort policy" below). Current
+models think by default, and `max_tokens` caps thinking *plus* answer, so each stage
+declares how hard it should think and keeps a rail loose enough to survive it.
+
+Research streams with `display: "summarized"` thinking: the summaries keep the wire
+active and make the long server-side phases visible in the log, instead of the silent
+gap that used to trip read timeouts.
 """
 
 from __future__ import annotations
@@ -38,6 +41,141 @@ _RETRYABLE = (
 _BACKOFF_SECONDS = (5, 15, 40)
 
 
+# --- Effort policy: how hard each stage thinks -------------------------------
+#
+# `max_tokens` is a hard cap on thinking PLUS answer text, and current models (Sonnet 5,
+# Opus 5) think by default when `thinking` is omitted. A budget trimmed to the expected
+# answer therefore truncates mid-thought, and `parse()` reports that as an empty result
+# rather than an error. Two knobs, never to be conflated:
+#
+#   effort     - how much JUDGMENT the step deserves. The real dial. Set per stage.
+#   max_tokens - a safety rail with thinking headroom. Set loosely; never "tuned".
+#
+# Effort does not track output size. `structure` turns an already-researched brief into
+# a long document (little judgment, lots of text -> low effort, big rail), while
+# `select_items` weighs a dozen candidates to emit six integers (real judgment, tiny
+# output -> medium effort, small rail).
+
+_EFFORT_LADDER = ("low", "medium", "high", "xhigh", "max")
+
+# One pipeline-wide profile shifts every stage by a notch, keeping their relative shape.
+_DEPTH_SHIFT = {"fast": -1, "balanced": 0, "deep": 1}
+DEPTHS = tuple(_DEPTH_SHIFT)
+DEFAULT_DEPTH = "balanced"
+
+
+class StagePolicy(BaseModel):
+    """The effort one stage runs at, plus the rail that catches a runaway."""
+
+    effort: str
+    max_tokens: int
+
+
+_POLICY = {
+    "select_topics": StagePolicy(effort="high", max_tokens=8000),
+    "structure": StagePolicy(effort="low", max_tokens=16000),
+    "select_items": StagePolicy(effort="medium", max_tokens=4000),
+    "rank_topics": StagePolicy(effort="medium", max_tokens=4000),
+    "edition_intro": StagePolicy(effort="low", max_tokens=2000),
+}
+
+# Research is the one stage whose rail is a real content knob (how long a brief may be),
+# so it keeps its own max_tokens on ResearchSettings; only its effort comes from here.
+_RESEARCH_EFFORT = "medium"
+
+
+def shift_effort(effort: str, notches: int) -> str:
+    """Move an effort level along the ladder, clamped at both ends."""
+    start = _EFFORT_LADDER.index(effort) if effort in _EFFORT_LADDER else 1
+    return _EFFORT_LADDER[max(0, min(len(_EFFORT_LADDER) - 1, start + notches))]
+
+
+def policy_for(stage: str, depth: str = DEFAULT_DEPTH) -> StagePolicy:
+    """The stage's policy, shifted by the pipeline-wide depth profile."""
+    base = _POLICY[stage]
+    shifted = shift_effort(base.effort, _DEPTH_SHIFT.get(depth, 0))
+    return base.model_copy(update={"effort": shifted})
+
+
+def research_effort_for(depth: str = DEFAULT_DEPTH) -> str:
+    """Research's per-turn effort under a given depth profile."""
+    return shift_effort(_RESEARCH_EFFORT, _DEPTH_SHIFT.get(depth, 0))
+
+
+class TruncatedError(RuntimeError):
+    """A response hit `max_tokens` before finishing - recoverable by giving it room."""
+
+
+def _no_output_error(stage: str, response) -> Exception:
+    """Turn an empty structured response into an error that says WHY it was empty."""
+    stop = getattr(response, "stop_reason", None)
+    if stop == "max_tokens":
+        used = getattr(getattr(response, "usage", None), "output_tokens", "?")
+        return TruncatedError(f"{stage}: hit max_tokens after {used} output tokens")
+    if stop == "refusal":
+        details = getattr(response, "stop_details", None)
+        return RuntimeError(f"{stage}: model declined ({details})")
+    return RuntimeError(f"{stage}: no parseable output (stop_reason={stop})")
+
+
+def _with_headroom(stage: str, depth: str, label: str, attempt):
+    """Run a stage, retrying once with more room if the model ran out of budget.
+
+    ``attempt(policy)`` makes the call and raises ``TruncatedError`` when the response was
+    cut off. Truncation is the one failure here that is mechanically recoverable: drop a
+    notch of effort (so it thinks less) and double the rail, then try once more. Anything
+    else - a refusal, an unparseable body - propagates with its reason attached.
+    """
+    policy = policy_for(stage, depth)
+    try:
+        return attempt(policy)
+    except TruncatedError as exc:
+        relaxed = StagePolicy(
+            effort=shift_effort(policy.effort, -1), max_tokens=policy.max_tokens * 2
+        )
+        _log(
+            f"  {label}   {exc}; retrying at effort={relaxed.effort}, "
+            f"max_tokens={relaxed.max_tokens}"
+        )
+        return attempt(relaxed)
+
+
+def _structured(
+    client: anthropic.Anthropic,
+    model: str,
+    stage: str,
+    system: str,
+    user: str,
+    output_format,
+    depth: str = DEFAULT_DEPTH,
+    label: str = "",
+):
+    """One structured-output call under its stage policy, with truncation named.
+
+    ``parse()`` signals truncation as ``parsed_output is None`` rather than raising, so
+    without this check a cut-off response is indistinguishable from a model that had
+    nothing to say - which is how a silent change in model defaults killed the 2026-09-13
+    issue under the message "Topic selection returned no topics."
+    """
+
+    def attempt(policy: StagePolicy):
+        response = client.messages.parse(
+            model=model,
+            max_tokens=policy.max_tokens,
+            output_config={"effort": policy.effort},
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            output_format=output_format,
+        )
+        parsed = getattr(response, "parsed_output", None)
+        if parsed is None:
+            raise _no_output_error(stage, response)
+        return parsed
+
+    return _with_headroom(stage, depth, label, attempt)
+
+
+
 # Two web-search server-tool variants:
 #   dynamic — writes+runs code to filter results before Claude reads them (thorough, but
 #             on some models runs away in an unbounded filtering loop);
@@ -49,11 +187,16 @@ _WEB_SEARCH_BASIC = "web_search_20250305"
 class ResearchSettings(BaseModel):
     """Search-depth knobs (from .env). Lower = faster/cheaper; raise for deeper digs.
 
+    ``depth`` is the pipeline-wide effort profile: it shifts every stage's policy a
+    notch (see "Effort policy"), including research's own ``effort`` unless a caller
+    overrides that explicitly (an A/B variant, or SEARCH_EFFORT).
+
     Together these put a hard, predictable ceiling on how long one topic can research:
     at most (max_rounds + 1) streamed turns, each doing at most max_uses web searches.
     """
 
-    effort: str = "medium"          # low | medium | high — reasoning effort per turn
+    depth: str = DEFAULT_DEPTH      # fast | balanced | deep — shifts EVERY stage's effort
+    effort: str = "medium"          # research's own per-turn effort (see policy_for)
     max_tokens: int = 8000          # length cap on the written brief
     max_uses: int = 5               # web searches allowed PER streamed turn
     max_rounds: int = 1             # extra pause_turn continuation rounds (0 = one turn)
@@ -113,7 +256,11 @@ The reaction you want is not "huh, weird" but "I had no idea there was THIS MUCH
 
 
 def select_topics(
-    client: anthropic.Anthropic, model: str, history: List[str], count: int
+    client: anthropic.Anthropic,
+    model: str,
+    history: List[str],
+    count: int,
+    depth: str = DEFAULT_DEPTH,
 ) -> List[_TopicIdea]:
     avoid = "\n".join(f"- {t}" for t in history) if history else "(nothing yet)"
     user = (
@@ -123,16 +270,12 @@ def select_topics(
         f"Aim for variety across the {count} — different domains and moods. "
         f"For each, give a title and a one-sentence angle."
     )
-    response = client.messages.parse(
-        model=model,
-        max_tokens=2000,
-        system=_TOPIC_SYSTEM,
-        messages=[{"role": "user", "content": user}],
-        output_format=_TopicSlate,
+    slate = _structured(
+        client, model, "select_topics", _TOPIC_SYSTEM, user, _TopicSlate,
+        depth=depth, label="topics",
     )
-    slate = response.parsed_output
-    if slate is None or not slate.topics:
-        raise RuntimeError("Topic selection returned no topics.")
+    if not slate.topics:
+        raise RuntimeError("Topic selection returned an empty slate.")
     return slate.topics[:count]
 
 
@@ -283,6 +426,10 @@ def _stream_one_turn(client, model, messages, settings, label, container):
             model=model,
             max_tokens=settings.max_tokens,
             system=_RESEARCH_SYSTEM,
+            # Summarized (not the "omitted" default): thinking blocks arrive with real
+            # text, so a long reasoning phase shows up in the log and on the wire as
+            # progress rather than as a stall.
+            thinking={"type": "adaptive", "display": "summarized"},
             output_config={"effort": settings.effort},
             tools=[settings.web_search_tool()],
             messages=messages,
@@ -342,7 +489,7 @@ def research_topic(
 ) -> str:
     """Run a web-search-backed research pass; return Claude's rich markdown writeup.
 
-    Streamed (without extended thinking) so the connection stays active for the several
+    Streamed (with summarized thinking) so the connection stays active for the several
     minutes a web-search-heavy request can take: streaming sends incremental deltas and
     periodic keep-alive pings, so the read timeout never trips even on a long job. A
     non-streaming version goes silent on the wire until the whole response is done, which
@@ -397,24 +544,25 @@ Order the items into a sensible reading/watching arc. Keep notes warm and specif
 
 
 def structure_deep_dive(
-    client: anthropic.Anthropic, model: str, topic: _TopicIdea, research: str
+    client: anthropic.Anthropic,
+    model: str,
+    topic: _TopicIdea,
+    research: str,
+    depth: str = DEFAULT_DEPTH,
+    label: str = "",
 ) -> DeepDive:
     user = (
         f"Topic title to use: {topic.title}\n\n"
         f"Research brief:\n\n{research}\n\n"
         f"Produce the structured deep dive."
     )
-    response = client.messages.parse(
-        model=model,
-        max_tokens=6000,
-        system=_STRUCTURE_SYSTEM,
-        messages=[{"role": "user", "content": user}],
-        output_format=DeepDive,
-    )
-    dive = response.parsed_output
-    if dive is None:
-        raise RuntimeError(f"Structuring failed for topic: {topic.title}")
-    return dive
+    try:
+        return _structured(
+            client, model, "structure", _STRUCTURE_SYSTEM, user, DeepDive,
+            depth=depth, label=label,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"Structuring failed for topic {topic.title!r}: {exc}") from exc
 
 
 # --- Stage 4: select the best items from the verified candidates -------------
@@ -442,6 +590,7 @@ def select_deep_dive(
     dive: DeepDive,
     final_items: int,
     label: str = "",
+    depth: str = DEFAULT_DEPTH,
 ) -> DeepDive:
     """Pick the best ``final_items`` from a verified DeepDive's candidates.
 
@@ -467,16 +616,12 @@ def select_deep_dive(
     )
     sel = None
     try:
-        response = client.messages.parse(
-            model=model,
-            max_tokens=500,
-            system=_SELECT_SYSTEM,
-            messages=[{"role": "user", "content": user}],
-            output_format=_Selection,
+        sel = _structured(
+            client, model, "select_items", _SELECT_SYSTEM, user, _Selection,
+            depth=depth, label=label,
         )
-        sel = response.parsed_output
     except Exception as exc:  # noqa: BLE001 - fall back to research order on any failure
-        _log(f"  {label}   selection call failed ({type(exc).__name__}); keeping first {final_items}")
+        _log(f"  {label}   selection call failed ({type(exc).__name__}: {exc}); keeping first {final_items}")
 
     kept: List = []
     if sel is not None:
@@ -527,6 +672,7 @@ def rank_topics_by_richness(
     dives: List[DeepDive],
     keep: int,
     label: str = "",
+    depth: str = DEFAULT_DEPTH,
 ) -> List[DeepDive]:
     """Keep the ``keep`` richest researched topics, judged by a stronger (Opus) model.
 
@@ -554,16 +700,12 @@ def rank_topics_by_richness(
 
     ranking = None
     try:
-        response = client.messages.parse(
-            model=judge_model,
-            max_tokens=500,
-            system=_TOPIC_RANK_SYSTEM,
-            messages=[{"role": "user", "content": user}],
-            output_format=_TopicRanking,
+        ranking = _structured(
+            client, judge_model, "rank_topics", _TOPIC_RANK_SYSTEM, user, _TopicRanking,
+            depth=depth, label=label,
         )
-        ranking = response.parsed_output
     except Exception as exc:  # noqa: BLE001 - fall back to research order on any failure
-        _log(f"  {label}   topic-rank call failed ({type(exc).__name__}); keeping first {keep}")
+        _log(f"  {label}   topic-rank call failed ({type(exc).__name__}: {exc}); keeping first {keep}")
 
     kept: List[DeepDive] = []
     if ranking is not None:
@@ -594,22 +736,38 @@ intellectual wandering — without mechanically listing them."""
 
 
 def _edition_intro(
-    client: anthropic.Anthropic, model: str, dives: List[DeepDive]
+    client: anthropic.Anthropic,
+    model: str,
+    dives: List[DeepDive],
+    depth: str = DEFAULT_DEPTH,
 ) -> str:
     titles = "; ".join(d.title for d in dives)
-    response = client.messages.create(
-        model=model,
-        max_tokens=600,
-        system=_INTRO_SYSTEM,
-        messages=[
-            {
-                "role": "user",
-                "content": f"This week's deep dives are: {titles}.\n\nWrite the note. "
-                f"Return only the note text, no preamble.",
-            }
-        ],
-    )
-    return "".join(b.text for b in response.content if b.type == "text").strip()
+
+    def attempt(policy: StagePolicy) -> str:
+        response = client.messages.create(
+            model=model,
+            max_tokens=policy.max_tokens,
+            output_config={"effort": policy.effort},
+            system=_INTRO_SYSTEM,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"This week's deep dives are: {titles}.\n\nWrite the note. "
+                    f"Return only the note text, no preamble.",
+                }
+            ],
+        )
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise TruncatedError("edition_intro: hit max_tokens before finishing the note")
+        return "".join(b.text for b in response.content if b.type == "text").strip()
+
+    try:
+        return _with_headroom("edition_intro", depth, "intro", attempt)
+    except TruncatedError as exc:
+        # The note is the one piece the issue can ship without; don't sink a whole
+        # newsletter over it.
+        _log(f"  intro still truncated after retry ({exc}); shipping without a note")
+        return ""
 
 
 def _research_and_structure(
@@ -623,11 +781,13 @@ def _research_and_structure(
     _log(f"  {label} researching '{topic.title}'...")
     brief = research_topic(client, model, topic, settings, label)
     _log(f"  {label}   structuring brief into a deep dive...")
-    dive = structure_deep_dive(client, model, topic, brief)
+    dive = structure_deep_dive(client, model, topic, brief, settings.depth, label)
     _log(f"  {label}   verifying {len(dive.items)} candidate links...")
     dive = verify.verify_dive(dive, label)
     _log(f"  {label}   selecting best {settings.final_items} of {len(dive.items)}...")
-    dive = select_deep_dive(client, model, dive, settings.final_items, label)
+    dive = select_deep_dive(
+        client, model, dive, settings.final_items, label, settings.depth
+    )
     _log(f"  {label} done: {topic.title} ({len(dive.items)} items)")
     return dive
 
@@ -657,7 +817,7 @@ def build_newsletter(
     topics_selected_fresh = topics is None
     if topics_selected_fresh:
         n_candidates = topic_candidates or count
-        topics = select_topics(client, model, history, n_candidates)
+        topics = select_topics(client, model, history, n_candidates, settings.depth)
         _log("  Topics chosen:")
     else:
         _log("  Topics (fixed):")
@@ -701,10 +861,12 @@ def build_newsletter(
     # mode (A/B) holds its set constant, so skip filtering there.
     if topics_selected_fresh and len(dives) > count:
         _log(f"  Judging {len(dives)} researched topics; keeping the best {count}...")
-        dives = rank_topics_by_richness(client, judge_model, dives, count)
+        dives = rank_topics_by_richness(
+            client, judge_model, dives, count, depth=settings.depth
+        )
 
     _log("  Writing the editor's note...")
-    intro = _edition_intro(client, model, dives)
+    intro = _edition_intro(client, model, dives, settings.depth)
     return Newsletter(
         edition_date=date.today().strftime("%A, %B %-d, %Y"),
         intro=intro,

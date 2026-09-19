@@ -104,7 +104,9 @@ def run_experiment(topics_path: str, variant_specs: List[str], limit: Optional[i
     client = anthropic.Anthropic(api_key=cfg.anthropic_api_key, timeout=600.0, max_retries=2)
     topics = _load_topics(topics_path, limit)
     base = curator.ResearchSettings(
-        effort=cfg.research_effort, max_tokens=cfg.research_max_tokens,
+        depth=cfg.depth,
+        effort=cfg.research_effort or curator.research_effort_for(cfg.depth),
+        max_tokens=cfg.research_max_tokens,
         max_uses=cfg.research_max_uses, max_rounds=cfg.research_max_rounds,
         dynamic_filtering=cfg.research_dynamic_filtering,
         candidate_items=cfg.research_candidate_items, final_items=cfg.deep_dive_items,

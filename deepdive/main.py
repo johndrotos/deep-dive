@@ -63,7 +63,8 @@ def _build(cfg: Config) -> Newsletter:
         max_retries=2,
     )
     settings = curator.ResearchSettings(
-        effort=cfg.research_effort,
+        depth=cfg.depth,
+        effort=cfg.research_effort or curator.research_effort_for(cfg.depth),
         max_tokens=cfg.research_max_tokens,
         max_uses=cfg.research_max_uses,
         max_rounds=cfg.research_max_rounds,
@@ -75,6 +76,8 @@ def _build(cfg: Config) -> Newsletter:
     print(f"  Avoiding {len(past)} previously-covered topics.")
     tool = "dynamic-filtering" if settings.dynamic_filtering else "basic"
     print(
+        f"  Depth profile: {settings.depth} (topic selection at "
+        f"{curator.policy_for('select_topics', settings.depth).effort} effort).\n"
         f"  Search depth: effort={settings.effort}, max_tokens={settings.max_tokens}, "
         f"max_uses={settings.max_uses}, max_rounds={settings.max_rounds}, tool={tool}."
     )

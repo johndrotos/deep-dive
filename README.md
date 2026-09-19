@@ -117,5 +117,6 @@ railway.json     start command + weekly cron
 ## Cost & tuning
 
 One run a week, so cost is small (roughly cents to a couple dollars depending on how much
-the model searches). Knobs via env vars: `ANTHROPIC_MODEL` (e.g. `claude-sonnet-5` to
-spend less), `DEEP_DIVE_COUNT`, `NEWSLETTER_TITLE`.
+the model searches). Knobs via env vars: `DEPTH` (`fast` / `balanced` / `deep` — one dial
+for how hard every stage thinks, and the main cost lever), `ANTHROPIC_MODEL`,
+`DEEP_DIVE_COUNT`, `NEWSLETTER_TITLE`.

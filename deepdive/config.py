@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from .curator import DEPTHS, DEFAULT_DEPTH
+
 try:
     # Optional: load a local .env when present. Never required in production.
     from dotenv import load_dotenv
@@ -32,7 +34,12 @@ class Config:
     # content turns out thin. Only used in the normal (non-fixed-topics) path.
     topic_candidates: int
     newsletter_title: str
+    # Pipeline-wide effort profile: fast | balanced | deep. Shifts EVERY stage's
+    # reasoning effort a notch (curator.policy_for), not just research.
+    depth: str
     # Search-depth knobs (speed vs. thoroughness). Lower = faster/cheaper.
+    # Deprecated explicit override for research's per-turn effort; empty means "derive
+    # it from `depth`". Kept so an A/B sweep (and any stale SEARCH_EFFORT) still works.
     research_effort: str
     research_max_tokens: int
     research_max_uses: int
@@ -90,7 +97,13 @@ class Config:
             return default
 
         deep_dive_count = int_env("DEEP_DIVE_COUNT", 3, minimum=1)
-        research_effort = os.environ.get("SEARCH_EFFORT", "medium").strip() or "medium"
+
+        depth = os.environ.get("DEPTH", DEFAULT_DEPTH).strip().lower() or DEFAULT_DEPTH
+        if depth not in DEPTHS:
+            raise ConfigError(
+                f"DEPTH must be one of {'|'.join(DEPTHS)} (got {depth!r})."
+            )
+        research_effort = os.environ.get("SEARCH_EFFORT", "").strip()
 
         return cls(
             anthropic_api_key=anthropic_api_key,
@@ -104,6 +117,7 @@ class Config:
             topic_candidates=int_env("TOPIC_CANDIDATES", 5, minimum=1),
             newsletter_title=os.environ.get("NEWSLETTER_TITLE", "The Deep Dive").strip()
             or "The Deep Dive",
+            depth=depth,
             research_effort=research_effort,
             research_max_tokens=int_env("SEARCH_MAX_TOKENS", 8000, minimum=1000),
             research_max_uses=int_env("SEARCH_MAX_USES", 5, minimum=1),

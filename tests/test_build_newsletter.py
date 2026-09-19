@@ -38,8 +38,9 @@ class _FakeClient:
 def test_overprovisions_five_then_ships_three(monkeypatch):
     captured = {}
 
-    def fake_select(client, model, history, count):
+    def fake_select(client, model, history, count, depth="balanced"):
         captured["candidate_count"] = count
+        captured["depth"] = depth
         return [make_topic(f"T{i}", "angle") for i in range(count)]
 
     def fake_research(client, model, topic, settings, label):
@@ -57,6 +58,7 @@ def test_overprovisions_five_then_ships_three(monkeypatch):
     )
 
     assert captured["candidate_count"] == 5           # over-provisioned
+    assert captured["depth"] == "balanced"            # profile reaches the stages
     assert len(nl.deep_dives) == 3                     # filtered to count
     assert [d.title for d in nl.deep_dives] == ["T0", "T1", "T2"]
     assert nl.intro == "intro"
