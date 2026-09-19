@@ -191,11 +191,20 @@ Current models think by default, and `max_tokens` is a hard cap on **thinking pl
 `low → medium → high → xhigh → max`, preserving their relative shape, so cost and
 thoroughness move together from a single knob.
 
-**Truncation is named and recovered, not swallowed.** `parse()` signals a cut-off response
-as `parsed_output is None`, which is indistinguishable from "the model had nothing to say".
-`curator._structured` inspects `stop_reason` and raises `TruncatedError` (vs. a refusal, vs.
-an unparseable body), and `_with_headroom` retries the stage **once** a notch lower in
-effort with a doubled rail — the one failure here that is mechanically recoverable.
+**Truncation is named and recovered, not swallowed.** A cut-off response reaches the
+caller in one of two shapes, depending on where the budget ran out, and *neither* says
+"truncated" on its face:
+
+- **no text block at all** → `parsed_output is None`, indistinguishable from "the model
+  had nothing to say" (the shape that produced the 2026-09-13 traceback);
+- **a half-written one** → `parse()` raises a pydantic `ValidationError`.
+
+`curator._structured` handles both: it reads `stop_reason` for the first and, for the
+second, treats a `json_invalid` error as truncation (with `output_config.format` the body
+is schema-constrained server-side, so unparseable JSON means cut off, not malformed) while
+letting a genuine schema mismatch through as its own error. `_with_headroom` then retries
+the stage **once** a notch lower in effort with a doubled rail — the one failure here that
+is mechanically recoverable.
 
 Research streams with `thinking={"type": "adaptive", "display": "summarized"}` rather than
 the `"omitted"` default: the summaries keep the wire active and surface long reasoning
@@ -318,7 +327,15 @@ These are the non-obvious things that cost real debugging. Don't undo them witho
     answer (topic selection at 2000, the index picks at 500) began truncating mid-thought.
     `parse()` reports that as `parsed_output is None`, not an exception — so topic
     selection killed the 2026-09-13 issue with "returned no topics" (the model had said
-    plenty), while item selection and topic ranking just silently fell back. The fix is structural, not a
+    plenty), while item selection and topic ranking just silently fell back.
+
+    Measured against the live API on 2026-09-19 (`claude-opus-5`, the topic-selection
+    prompt, 12 topics of history): at `max_tokens=2000` the model spent **1999 tokens
+    thinking**, returned `['thinking']` and no text block at all, and stopped on
+    `max_tokens`. At 8000 the same request finished in 2610 tokens (1780 of them thinking)
+    and returned all five topics; at 2000 with `thinking: {"type": "disabled"}` it finished
+    in 556. The budget was never close — thinking alone needed more than the whole rail.
+    The fix is structural, not a
     bigger number: **effort** is the per-stage intent dial, **`max_tokens`** is a loose rail
     with thinking headroom, and truncation is caught by name and retried (§4a). The tests
     missed all of it because the fakes returned a canned `parsed_output` with no

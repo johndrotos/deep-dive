@@ -6,6 +6,7 @@ had nothing to say" — the confusion that took three weekly issues down silentl
 """
 
 import pytest
+from pydantic import ValidationError
 
 from deepdive import curator
 from deepdive.curator import (
@@ -31,7 +32,11 @@ class _Resp:
 
 
 class _ScriptedMessages:
-    """Returns the scripted responses in order, repeating the last one."""
+    """Returns the scripted responses in order, repeating the last one.
+
+    A scripted entry that is an exception is raised instead of returned - that is how
+    the real SDK reports a half-written JSON body.
+    """
 
     def __init__(self, responses):
         self._responses = list(responses)
@@ -39,7 +44,10 @@ class _ScriptedMessages:
 
     def _next(self, kwargs):
         self.calls.append(kwargs)
-        return self._responses.pop(0) if len(self._responses) > 1 else self._responses[0]
+        item = self._responses.pop(0) if len(self._responses) > 1 else self._responses[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     def parse(self, **kwargs):
         return self._next(kwargs)
@@ -124,6 +132,37 @@ def test_truncation_twice_raises_named_error():
         curator._structured(client, "m", "select_topics", "s", "u", _TopicSlate)
 
     assert len(client.messages.calls) == 2  # tried once, retried once, then gave up
+
+
+def _validation_error(payload: str) -> ValidationError:
+    """A real pydantic error, produced the way the SDK's parser produces one."""
+    try:
+        _TopicSlate.model_validate_json(payload)
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("payload unexpectedly validated")
+
+
+def test_half_written_json_counts_as_truncation():
+    # The other shape of a cut-off response: thinking stopped just short, leaving the
+    # JSON body unfinished, and parse() raises instead of returning None.
+    slate = _TopicSlate(topics=[curator.make_topic("A", "angle")])
+    cut_off = _validation_error('{"topics":[{"title":"The Bog Peo')
+    client = _Client(cut_off, _Resp(parsed=slate))
+
+    assert curator._structured(client, "m", "select_topics", "s", "u", _TopicSlate) is slate
+    assert client.messages.calls[1]["max_tokens"] == client.messages.calls[0]["max_tokens"] * 2
+
+
+def test_schema_mismatch_is_not_treated_as_truncation():
+    # Valid JSON that doesn't fit the schema is a different bug; retrying won't fix it.
+    client = _Client(_validation_error('{"topics": "not a list"}'))
+
+    with pytest.raises(RuntimeError, match="did not match the schema") as excinfo:
+        curator._structured(client, "m", "select_topics", "s", "u", _TopicSlate)
+
+    assert not isinstance(excinfo.value, TruncatedError)
+    assert len(client.messages.calls) == 1
 
 
 def test_refusal_is_reported_as_a_refusal_and_not_retried():

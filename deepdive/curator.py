@@ -25,7 +25,7 @@ from datetime import date
 from typing import List, Optional
 
 import anthropic
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from . import verify
 from .models import DeepDive, Newsletter
@@ -118,6 +118,19 @@ def _no_output_error(stage: str, response) -> Exception:
     return RuntimeError(f"{stage}: no parseable output (stop_reason={stop})")
 
 
+def _invalid_json_error(stage: str, exc: ValidationError) -> Exception:
+    """Classify a `parse()` ValidationError.
+
+    Truncation has two shapes, depending on where the budget ran out: no text block at
+    all (``parsed_output is None``, handled above) or a half-written one, which `parse()`
+    raises on. `output_config.format` constrains the body to the schema server-side, so
+    JSON that doesn't parse means it was cut off mid-value, not malformed.
+    """
+    if any(err.get("type") == "json_invalid" for err in exc.errors()):
+        return TruncatedError(f"{stage}: response JSON was cut off mid-value")
+    return RuntimeError(f"{stage}: response did not match the schema ({exc})")
+
+
 def _with_headroom(stage: str, depth: str, label: str, attempt):
     """Run a stage, retrying once with more room if the model ran out of budget.
 
@@ -152,21 +165,25 @@ def _structured(
 ):
     """One structured-output call under its stage policy, with truncation named.
 
-    ``parse()`` signals truncation as ``parsed_output is None`` rather than raising, so
-    without this check a cut-off response is indistinguishable from a model that had
-    nothing to say - which is how a silent change in model defaults killed the 2026-09-13
-    issue under the message "Topic selection returned no topics."
+A cut-off response reaches us two ways - ``parsed_output is None`` when no text block
+    was emitted at all, or a ``ValidationError`` when a half-written one was - and neither
+    says "truncated" on its face. Left unclassified, both are indistinguishable from a
+    model that had nothing to say, which is how a silent change in model defaults killed
+    the 2026-09-13 issue under the message "Topic selection returned no topics."
     """
 
     def attempt(policy: StagePolicy):
-        response = client.messages.parse(
-            model=model,
-            max_tokens=policy.max_tokens,
-            output_config={"effort": policy.effort},
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            output_format=output_format,
-        )
+        try:
+            response = client.messages.parse(
+                model=model,
+                max_tokens=policy.max_tokens,
+                output_config={"effort": policy.effort},
+                system=system,
+                messages=[{"role": "user", "content": user}],
+                output_format=output_format,
+            )
+        except ValidationError as exc:
+            raise _invalid_json_error(stage, exc) from exc
         parsed = getattr(response, "parsed_output", None)
         if parsed is None:
             raise _no_output_error(stage, response)
